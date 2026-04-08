@@ -1,6 +1,6 @@
 # Autism Search 自闭症内容搜索服务
 
-基于 PostgreSQL + pgvector 的混合搜索 REST API，支持语义搜索与关键词搜索，覆盖多来源自闭症相关内容。
+基于 PostgreSQL + pgvector 的混合搜索 REST API，支持语义搜索与关键词搜索，覆盖多来源自闭症相关内容。 
 
 ---
 
