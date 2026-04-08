@@ -1,0 +1,29 @@
+# Environment — contains secrets (DATABASE_URL, API keys)
+.env
+
+# Runtime files
+.uvicorn.pid
+uvicorn.log
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Package build artifacts
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# fastembed model cache (downloaded at runtime, ~270MB)
+.cache/
+models/
+
+# OS
+.DS_Store
+Thumbs.db
