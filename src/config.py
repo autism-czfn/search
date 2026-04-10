@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     default_result_limit: int = 10
     max_result_limit: int = 50
     log_level: str = "INFO"
+    ncbi_api_key: str | None = None
 
 
 settings = Settings()

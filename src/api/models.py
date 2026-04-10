@@ -60,6 +60,15 @@ class SearchResponse(BaseModel):
     llm_time_ms: int | None = Field(
         None, description="Time taken to generate summary in ms; null if unavailable"
     )
+    agent_iterations: int | None = Field(
+        None,
+        description=(
+            "1 if the enhanced claude -p agent ran successfully (internal loop "
+            "count is opaque and not exposed). "
+            "null if the enhanced agent was not used (fallback to single-shot "
+            "summarize())."
+        ),
+    )
 
 
 class StatsResponse(BaseModel):

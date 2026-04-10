@@ -18,6 +18,7 @@ from ..embedder import embed_query
 from ..search.keyword import keyword_search
 from ..search.semantic import semantic_search
 from ..search.hybrid import merge_and_rerank
+from ..llm.agent import run_agent
 from ..llm.summarize import summarize
 from .models import SearchResponse, SearchResult, StatsResponse, HealthResponse
 
@@ -84,15 +85,29 @@ async def search(
 
     elapsed_ms = int((t4 - t0) * 1000)
 
-    # Step 5: summarize top 5 results via claude -p
+    # Step 5: run enhanced agent (claude -p with Read + Bash tools)
     t_llm = time.monotonic()
-    log.info("search LLM START sending %d results to claude -p", min(len(merged), 5))
-    summary = await summarize(q, merged[:5])
-    llm_ms = int((time.monotonic() - t_llm) * 1000)
-    log.info(
-        "search LLM DONE ok=%s elapsed=%dms",
-        summary is not None, llm_ms,
+    agent_iterations: int | None = None
+    summary: str | None = None
+
+    agent_summary, agent_iters = await run_agent(
+        query=q,
+        initial_results=merged[:5],
+        pool=pool,
+        fetch_limit=fetch_limit,
     )
+    llm_ms = int((time.monotonic() - t_llm) * 1000)
+
+    if agent_summary is not None:
+        summary = agent_summary
+        agent_iterations = agent_iters
+        log.info("search LLM agent OK elapsed=%dms", llm_ms)
+    else:
+        # Fallback to single-shot claude -p summarize()
+        log.info("search LLM agent failed/skipped — falling back to summarize()")
+        summary = await summarize(q, merged[:5])
+        llm_ms = int((time.monotonic() - t_llm) * 1000)
+        log.info("search LLM summarize ok=%s elapsed=%dms", summary is not None, llm_ms)
 
     log.info(
         "search COMPLETE q=%r mode=%s results=%d search=%dms llm=%dms",
@@ -106,6 +121,7 @@ async def search(
         search_time_ms=elapsed_ms,
         summary=summary,
         llm_time_ms=llm_ms if summary is not None else None,
+        agent_iterations=agent_iterations,
     )
 
 
