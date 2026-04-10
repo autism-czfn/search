@@ -2,8 +2,9 @@
 
 PORT=3001
 APP="src.main:app"
-PIDFILE=".uvicorn.pid"
-LOGFILE="uvicorn.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIDFILE="$SCRIPT_DIR/.uvicorn.pid"
+LOGFILE="$SCRIPT_DIR/uvicorn.log"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -21,8 +22,12 @@ is_running() {
         local pid
         pid=$(cat "$PIDFILE")
         if kill -0 "$pid" 2>/dev/null; then
-            return 0   # running
+            return 0   # running, PID valid
         fi
+    fi
+    # Fallback: check if something is actually bound to the port
+    if lsof -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
+        return 0   # port is live even without a valid pidfile
     fi
     return 1   # not running
 }
@@ -36,7 +41,11 @@ start_service() {
         pid=$(cat "$PIDFILE")
         echo "  ↻  Service already running (PID $pid) — restarting..."
         kill "$pid" 2>/dev/null
-        sleep 1
+        # Wait up to 5 s for the port to be released
+        for i in {1..10}; do
+            sleep 0.5
+            lsof -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q . || break
+        done
     fi
 
     nohup uvicorn "$APP" --host 0.0.0.0 --port "$PORT" > "$LOGFILE" 2>&1 &

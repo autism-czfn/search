@@ -3,14 +3,16 @@ from __future__ import annotations
 FastAPI route handlers for autism-search.
 
 Endpoints:
-  GET /api/search   — hybrid / keyword-only search
-  GET /api/stats    — crawled_items statistics
-  GET /api/health   — liveness + DB connectivity check
+  GET /api/search        — hybrid / keyword-only search (blocking)
+  GET /api/search/stream — same search via Server-Sent Events (streaming)
+  GET /api/stats         — crawled_items statistics
+  GET /api/health        — liveness + DB connectivity check
 """
 
 import logging
 import time
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from ..config import settings
 from ..db import get_pool
@@ -21,6 +23,7 @@ from ..search.hybrid import merge_and_rerank
 from ..llm.agent import run_agent
 from ..llm.summarize import summarize
 from .models import SearchResponse, SearchResult, StatsResponse, HealthResponse
+from .stream import search_stream_generator
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
@@ -122,6 +125,47 @@ async def search(
         summary=summary,
         llm_time_ms=llm_ms if summary is not None else None,
         agent_iterations=agent_iterations,
+    )
+
+
+# ── /api/search/stream ───────────────────────────────────────────────────────
+
+@router.get("/search/stream")
+async def search_stream(
+    q: str = Query(..., min_length=1, description="Search query text"),
+    limit: int | None = Query(default=None, ge=1, description="Max results to return"),
+    source: str | None = Query(default=None, description="Filter by source (e.g. reddit, pubmed)"),
+    days: int | None = Query(default=None, ge=1, description="Only items published within N days"),
+    pool=Depends(get_pool),
+):
+    """
+    Streaming variant of /api/search — returns Server-Sent Events.
+
+    Event sequence:
+      stage (×4-5) → results → agent_activity (×0-N) → summary → done
+
+    The `results` event arrives before the LLM runs, so the browser can
+    render source cards immediately while the agent composes the answer.
+    Falls back through two tiers: streaming agent → single-shot summarize(),
+    so the UI always receives a summary event unless the database itself
+    is unavailable.
+    """
+    effective_limit = min(
+        limit if limit is not None else settings.default_result_limit,
+        settings.max_result_limit,
+    )
+    log.info(
+        "search_stream START q=%r limit=%s source=%s days=%s",
+        q, effective_limit, source, days,
+    )
+    return StreamingResponse(
+        search_stream_generator(q, effective_limit, source, days, pool),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "Connection":        "keep-alive",
+            "X-Accel-Buffering": "no",   # disable nginx / proxy response buffering
+        },
     )
 
 
