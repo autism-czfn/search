@@ -23,6 +23,13 @@ SearchMode = Literal["hybrid", "keyword_only"]
 SEMANTIC_WEIGHT = 0.7
 KEYWORD_WEIGHT = 0.3
 
+# Sources considered authoritative; receive a score boost during reranking
+AUTHORITY_SOURCES = {
+    "cdc", "nih", "who", "pubmed", "mayoclinic", "webmd",
+    "autism_speaks", "aap", "nimh", "nhs",
+}
+AUTHORITY_BOOST = 0.15   # additive bonus on top of combined score (0–1 range)
+
 
 def _normalise(values: list[float]) -> list[float]:
     """Min-max normalise a list of floats to [0, 1]."""
@@ -88,6 +95,11 @@ def merge_and_rerank(
             combined = kn
         else:
             combined = SEMANTIC_WEIGHT * sn + KEYWORD_WEIGHT * kn
+
+        # Boost authoritative sources so they rank above community posts
+        source = (it.get("source") or "").lower().replace("-", "_").replace(" ", "_")
+        if source in AUTHORITY_SOURCES:
+            combined = min(combined + AUTHORITY_BOOST, 1.0)
 
         it["semantic_score"] = round(sn, 6)
         it["keyword_score"]  = round(kn, 6)

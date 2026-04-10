@@ -46,20 +46,28 @@ async def search(
     fetch_limit = effective_limit * 2   # fetch more before reranking
 
     t0 = time.monotonic()
+    log.info("search START q=%r limit=%s source=%s days=%s", q, effective_limit, source, days)
 
     # Step 1: try to embed the query (may return None → keyword-only mode)
     embedding = await embed_query(q)
+    t1 = time.monotonic()
+    log.info("search EMBED done=%s elapsed=%dms", embedding is not None, int((t1 - t0) * 1000))
 
     # Step 2: semantic search (skipped if no embedding)
     sem_results: list[dict] = []
     if embedding is not None:
         sem_results = await semantic_search(pool, embedding, fetch_limit, source, days)
+    t2 = time.monotonic()
+    log.info("search SEMANTIC rows=%d elapsed=%dms", len(sem_results), int((t2 - t1) * 1000))
 
     # Step 3: keyword search (always runs)
     kw_results = await keyword_search(pool, q, fetch_limit, source, days)
+    t3 = time.monotonic()
+    log.info("search KEYWORD rows=%d elapsed=%dms", len(kw_results), int((t3 - t2) * 1000))
 
     if not sem_results and not kw_results:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
+        log.info("search DONE no results total=%dms", elapsed_ms)
         return SearchResponse(
             results=[],
             total=0,
@@ -71,18 +79,24 @@ async def search(
 
     # Step 4: merge + rerank
     merged, mode = merge_and_rerank(sem_results, kw_results, top_n=effective_limit)
+    t4 = time.monotonic()
+    log.info("search MERGE mode=%s results=%d elapsed=%dms", mode, len(merged), int((t4 - t3) * 1000))
 
-    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    elapsed_ms = int((t4 - t0) * 1000)
 
     # Step 5: summarize top 5 results via claude -p
     t_llm = time.monotonic()
+    log.info("search LLM START sending %d results to claude -p", min(len(merged), 5))
     summary = await summarize(q, merged[:5])
-    llm_ms = int((time.monotonic() - t_llm) * 1000) if summary is not None else None
+    llm_ms = int((time.monotonic() - t_llm) * 1000)
+    log.info(
+        "search LLM DONE ok=%s elapsed=%dms",
+        summary is not None, llm_ms,
+    )
 
     log.info(
-        "search q=%r mode=%s results=%d time=%dms llm=%s",
-        q, mode, len(merged), elapsed_ms,
-        f"{llm_ms}ms" if llm_ms is not None else "unavailable",
+        "search COMPLETE q=%r mode=%s results=%d search=%dms llm=%dms",
+        q, mode, len(merged), elapsed_ms, llm_ms,
     )
 
     return SearchResponse(
@@ -91,7 +105,7 @@ async def search(
         search_mode=mode,
         search_time_ms=elapsed_ms,
         summary=summary,
-        llm_time_ms=llm_ms,
+        llm_time_ms=llm_ms if summary is not None else None,
     )
 
 

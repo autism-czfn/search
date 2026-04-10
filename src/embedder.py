@@ -5,7 +5,9 @@ Returns a list of floats (vector of length 768 for nomic-embed-text-v1.5).
 Falls back gracefully — callers handle None to switch to keyword-only mode.
 """
 
+import asyncio
 import logging
+import time
 from fastembed import TextEmbedding
 
 log = logging.getLogger(__name__)
@@ -32,9 +34,16 @@ async def embed_query(text: str) -> list[float] | None:
     if not text.strip():
         return None
     try:
+        cold = _model is None
         model = _get_model()
-        vectors = list(model.embed([text.strip()]))
+        log.info("embed START cold_load=%s text_len=%d", cold, len(text.strip()))
+        t0 = time.monotonic()
+        loop = asyncio.get_event_loop()
+        vectors = await loop.run_in_executor(
+            None, lambda: list(model.embed([text.strip()]))
+        )
+        log.info("embed DONE dims=%d elapsed=%dms", len(vectors[0]), int((time.monotonic() - t0) * 1000))
         return vectors[0].tolist()
     except Exception as e:
-        log.warning("Embedding error: %s — falling back to keyword-only search", e)
+        log.warning("embed FAIL %s — falling back to keyword-only search", e)
         return None

@@ -5,9 +5,10 @@ Returns a plain-text summary string, or None on any failure.
 None signals the caller to return results without a summary.
 """
 
+import asyncio
 import logging
 import os
-import subprocess
+import time
 
 log = logging.getLogger(__name__)
 
@@ -31,11 +32,16 @@ def _build_prompt(query: str, results: list[dict]) -> str:
     sources_text = "\n\n".join(sources)
 
     return (
-        "You are a helpful assistant. Answer the user's question concisely "
-        "using only the provided sources. Cite sources by number [1], [2], etc.\n\n"
+        "You are a medical and scientific information assistant. "
+        "Answer the user's question accurately and concisely using only the provided sources. "
+        "Strongly prefer information from official or scientific sources "
+        "(e.g. CDC, NIH, PubMed, WHO, medical journals, government health agencies) "
+        "over anecdotal or community posts (e.g. Reddit, forums, personal blogs). "
+        "If only community sources are available, mention that official sources were not found. "
+        "Cite sources by number [1], [2], etc.\n\n"
         f"Question: {query}\n\n"
         f"Sources:\n{sources_text}\n\n"
-        "Answer in 2–4 sentences."
+        "Answer in 3–5 sentences based on the most authoritative sources available."
     )
 
 
@@ -53,31 +59,47 @@ async def summarize(query: str, results: list[dict]) -> str | None:
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)   # allow claude -p outside a nested session
 
-        proc = subprocess.run(
-            ["claude", "-p", prompt],
-            capture_output=True,
-            text=True,
-            timeout=SUMMARY_TIMEOUT,
+        log.info("summarize LAUNCH claude -p (timeout=%ds prompt_chars=%d)", SUMMARY_TIMEOUT, len(prompt))
+        t0 = time.monotonic()
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        if proc.returncode != 0:
+        log.info("summarize WAITING pid=%s", proc.pid)
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=SUMMARY_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()   # drain pipes to avoid zombie
             log.warning(
-                "claude -p exited with code %d: %s",
-                proc.returncode,
-                proc.stderr.strip()[:200],
+                "summarize TIMEOUT claude -p exceeded %ds after %dms — summary unavailable",
+                SUMMARY_TIMEOUT, int((time.monotonic() - t0) * 1000),
             )
             return None
-        output = proc.stdout.strip()
-        if not output:
-            log.warning("claude -p returned empty output")
+
+        elapsed = int((time.monotonic() - t0) * 1000)
+        if proc.returncode != 0:
+            log.warning(
+                "summarize FAIL claude -p exit=%d elapsed=%dms stderr=%r",
+                proc.returncode,
+                elapsed,
+                stderr.decode(errors="replace").strip()[:200],
+            )
             return None
+        output = stdout.decode(errors="replace").strip()
+        if not output:
+            log.warning("summarize FAIL claude -p empty output elapsed=%dms", elapsed)
+            return None
+        log.info("summarize OK chars=%d elapsed=%dms", len(output), elapsed)
         return output
 
     except FileNotFoundError:
-        log.warning("claude CLI not found — summary unavailable")
-    except subprocess.TimeoutExpired:
-        log.warning("claude -p timed out after %ds — summary unavailable", SUMMARY_TIMEOUT)
+        log.warning("summarize FAIL claude CLI not found — is 'claude' on PATH?")
     except Exception as e:
-        log.warning("claude -p unexpected error: %s — summary unavailable", e)
+        log.warning("summarize FAIL unexpected error: %s — summary unavailable", e)
 
     return None
