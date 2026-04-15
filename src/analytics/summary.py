@@ -17,6 +17,8 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
+from .daily_checks import fetch_check_averages
+
 log = logging.getLogger(__name__)
 
 NARRATE_TIMEOUT = 30   # seconds for claude -p
@@ -61,11 +63,18 @@ async def _compute_weekly_stats(pool, week_start: date, week_end: date) -> dict:
         {"outcome": o, "count": c} for o, c in outcome_counts.most_common(3)
     ]
 
+    # Daily check-in averages for the week
+    check_data = await fetch_check_averages(pool, week_start, week_end)
+
     return {
         "event_count":            len(rows),
         "top_triggers":           top_triggers,
         "top_outcomes":           top_outcomes,
         "interventions_adopted":  [r["suggestion_text"] for r in adopted_rows],
+        "daily_check_summary": {
+            "coverage": check_data["coverage_days"],
+            "averages": check_data["averages"],
+        },
     }
 
 

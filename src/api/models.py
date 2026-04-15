@@ -130,6 +130,47 @@ class InterventionEffectiveness(BaseModel):
     confidence_level: str
 
 
+class DailyCheckAverages(BaseModel):
+    sleep_quality: float | None = None
+    mood: float | None = None
+    sensory_sensitivity: float | None = None
+    appetite: float | None = None
+    social_tolerance: float | None = None
+    meltdown_count: float | None = None
+    routine_adherence: float | None = None
+    communication_ease: float | None = None
+    physical_activity: float | None = None
+    caregiver_rating: float | None = None
+
+
+class LowSleepCorrelation(BaseModel):
+    low_sleep_days: int
+    meltdown_log_avg_low_sleep: float | None = None
+    meltdown_log_avg_other_days: float | None = None
+    delta: float | None = None
+
+
+class DailyCheckTrends(BaseModel):
+    coverage_days: int
+    total_days: int
+    averages: DailyCheckAverages
+    low_sleep_meltdown_correlation: LowSleepCorrelation
+
+
+class WeeklyCheckTrend(BaseModel):
+    week_start: str
+    sleep_quality_avg: float | None = None
+    mood_avg: float | None = None
+    caregiver_rating_avg: float | None = None
+
+
+class DailyCheckSummary(BaseModel):
+    coverage_days: int
+    total_days: int
+    averages: DailyCheckAverages
+    weekly_trends: list[WeeklyCheckTrend]
+
+
 class InsightsResponse(BaseModel):
     top_triggers: list[TriggerCount]
     top_outcomes: list[OutcomeCount]
@@ -137,6 +178,7 @@ class InsightsResponse(BaseModel):
     intervention_effectiveness: list[InterventionEffectiveness]
     log_count: int
     date_range: dict[str, Any]
+    daily_check_trends: DailyCheckTrends
 
 
 class WeeklySummaryResponse(BaseModel):
@@ -160,5 +202,6 @@ class ClinicianReportResponse(BaseModel):
     top_outcomes: list[OutcomeCount]
     patterns: list[PatternEntry]
     intervention_outcomes: list[InterventionEffectiveness]
+    daily_check_summary: DailyCheckSummary | None = None
     key_concerns_text: str | None
     generated_at: str

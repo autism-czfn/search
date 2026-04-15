@@ -7,7 +7,9 @@ No LLM involved — all values are SQL/Python computations.
 import json
 import logging
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+
+from .daily_checks import fetch_check_averages, fetch_low_sleep_correlation
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +80,27 @@ async def fetch_log_context(pool) -> str | None:
         ],
         "active_interventions": [r["suggestion_text"] for r in active_interventions],
     }
+
+    # Step 2b: inject last 7 days of daily check-in averages (5 key ratings)
+    # Skip if fewer than 3 days have check-ins — insufficient data.
+    try:
+        today     = date.today()
+        check_data = await fetch_check_averages(pool, today - timedelta(days=7), today)
+        if check_data["coverage_days"] >= 3:
+            avgs = check_data["averages"]
+            def _fmt(v: float | None) -> str:
+                return f"{v:.1f}" if v is not None else "n/a"
+            context["check_in_averages_7d"] = (
+                f"sleep={_fmt(avgs['sleep_quality'])}, "
+                f"mood={_fmt(avgs['mood'])}, "
+                f"sensory={_fmt(avgs['sensory_sensitivity'])}, "
+                f"meltdown_count_avg={_fmt(avgs['meltdown_count'])}, "
+                f"caregiver_rating={_fmt(avgs['caregiver_rating'])} "
+                f"(N={check_data['coverage_days']} days)"
+            )
+    except Exception as e:
+        log.warning("fetch_log_context: check-in averages failed: %s", e)
+
     return json.dumps(context)
 
 
@@ -251,6 +274,12 @@ async def fetch_insights(pool, days: int) -> dict:
         for r in pattern_rows
     ]
 
+    # Daily check-in trends (SQL aggregates over mzhu_test_daily_checks)
+    from_date = date.today() - timedelta(days=days)
+    to_date   = date.today()
+    check_data  = await fetch_check_averages(pool, from_date, to_date)
+    correlation = await fetch_low_sleep_correlation(pool, from_date, to_date)
+
     return {
         "top_triggers":              top_triggers,
         "top_outcomes":              top_outcomes,
@@ -260,5 +289,9 @@ async def fetch_insights(pool, days: int) -> dict:
         "date_range": {
             "from": str(date_row["from_date"]) if date_row and date_row["from_date"] else None,
             "to":   str(date_row["to_date"])   if date_row and date_row["to_date"]   else None,
+        },
+        "daily_check_trends": {
+            **check_data,
+            "low_sleep_meltdown_correlation": correlation,
         },
     }

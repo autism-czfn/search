@@ -15,6 +15,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from .patterns import _pattern_confidence, _intervention_confidence
+from .daily_checks import fetch_check_averages, fetch_weekly_check_trends
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +156,13 @@ async def _compute_stats(user_pool, days: int) -> dict:
                 "confidence_level":     _intervention_confidence(window),
             })
 
+    # Daily check-in trends over the full lookback window
+    from datetime import date as _date
+    check_from = _date.today() - timedelta(days=days)
+    check_to   = _date.today()
+    check_data     = await fetch_check_averages(user_pool, check_from, check_to)
+    weekly_trends  = await fetch_weekly_check_trends(user_pool, check_from, check_to)
+
     return {
         "date_range": {
             "from": str(date_row["from_date"]) if date_row and date_row["from_date"] else None,
@@ -168,6 +176,12 @@ async def _compute_stats(user_pool, days: int) -> dict:
         "top_outcomes":          top_outcomes,
         "patterns":              patterns,
         "intervention_outcomes": intervention_outcomes,
+        "daily_check_summary": {
+            "coverage_days": check_data["coverage_days"],
+            "total_days":    check_data["total_days"],
+            "averages":      check_data["averages"],
+            "weekly_trends": weekly_trends,
+        },
     }
 
 
