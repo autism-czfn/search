@@ -63,11 +63,23 @@ async def _compute_weekly_stats(pool, week_start: date, week_end: date) -> dict:
         {"outcome": o, "count": c} for o, c in outcome_counts.most_common(3)
     ]
 
-    # Daily check-in averages for the week
+    # Daily check-in averages + meltdown total for the week
     check_data = await fetch_check_averages(pool, week_start, week_end)
+
+    async with pool.acquire() as conn:
+        mc_row = await conn.fetchrow(
+            """
+            SELECT COALESCE(SUM((ratings->>'meltdown_count')::numeric), 0)::int AS total
+            FROM mzhu_test_daily_checks
+            WHERE check_date BETWEEN $1 AND $2
+            """,
+            week_start, week_end,
+        )
+    meltdown_total = int(mc_row["total"])
 
     return {
         "event_count":            len(rows),
+        "meltdown_count":         meltdown_total,
         "top_triggers":           top_triggers,
         "top_outcomes":           top_outcomes,
         "interventions_adopted":  [r["suggestion_text"] for r in adopted_rows],
