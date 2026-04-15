@@ -1,7 +1,7 @@
 from __future__ import annotations
 """
 autism-search — FastAPI application entry point.
-Run with: uvicorn src.main:app --reload --port 3001
+Run with: uvicorn src.main:app --reload --port 3002
 """
 
 import logging

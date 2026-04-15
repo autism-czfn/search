@@ -67,7 +67,8 @@ async def _compute_stats(user_pool, days: int) -> dict:
         week_buckets[week_key] = week_buckets.get(week_key, 0) + 1
         for t in (row["triggers"] or []):
             trigger_counts[t] += 1
-        outcome_counts[row["outcome"]] += 1
+        if row["outcome"] is not None:
+            outcome_counts[row["outcome"]] += 1
 
     total_triggers = sum(trigger_counts.values()) or 1
     total_outcomes = sum(outcome_counts.values()) or 1
@@ -93,6 +94,8 @@ async def _compute_stats(user_pool, days: int) -> dict:
     pair_counts: Counter = Counter()
     trigger_totals: Counter = Counter()
     for row in rows:
+        if row["outcome"] is None:
+            continue
         for t in (row["triggers"] or []):
             trigger_totals[t] += 1
             pair_counts[(t, row["outcome"])] += 1
@@ -262,9 +265,50 @@ async def _narrate_key_concerns(stats: dict, evidence: list[dict]) -> str | None
         return None
 
 
+# ── Cache helpers ─────────────────────────────────────────────────────────────
+
+async def _get_cached_report(user_pool, ttl_hours: int = 2) -> dict | None:
+    try:
+        async with user_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT report_json FROM mzhu_test_clinician_cache
+                WHERE generated_at > now() - make_interval(hours => $1)
+                ORDER BY generated_at DESC LIMIT 1
+                """,
+                ttl_hours,
+            )
+        if row:
+            data = row["report_json"]
+            return json.loads(data) if isinstance(data, str) else data
+        return None
+    except Exception as e:
+        log.warning("clinician cache read failed: %s", e)
+        return None
+
+
+async def _persist_report(user_pool, report: dict) -> None:
+    try:
+        async with user_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO mzhu_test_clinician_cache (report_json) VALUES ($1::jsonb)",
+                json.dumps(report, default=str),
+            )
+            await conn.execute(
+                "DELETE FROM mzhu_test_clinician_cache WHERE generated_at < now() - interval '24 hours'",
+            )
+    except Exception as e:
+        log.warning("clinician cache write failed: %s", e)
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
-async def get_clinician_report(user_pool, evidence_pool, days: int) -> dict:
+async def get_clinician_report(user_pool, evidence_pool, days: int, refresh: bool = False) -> dict:
+    if not refresh:
+        cached = await _get_cached_report(user_pool)
+        if cached:
+            return {**cached, "cached": True}
+
     stats = await _compute_stats(user_pool, days)
 
     top_trigger = (
@@ -274,8 +318,11 @@ async def get_clinician_report(user_pool, evidence_pool, days: int) -> dict:
 
     key_concerns = await _narrate_key_concerns(stats, evidence)
 
-    return {
+    report = {
         **stats,
         "key_concerns_text": key_concerns,
         "generated_at":      datetime.now(timezone.utc).isoformat(),
+        "cached":            False,
     }
+    await _persist_report(user_pool, report)
+    return report

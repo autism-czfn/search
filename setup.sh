@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-PORT=3001
+PORT=3002
 APP="src.main:app"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIDFILE="$SCRIPT_DIR/.uvicorn.pid"

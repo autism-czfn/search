@@ -106,8 +106,48 @@ async def fetch_log_context(pool) -> str | None:
 
 # ── Insights ──────────────────────────────────────────────────────────────────
 
-async def fetch_insights(pool, days: int) -> dict:
-    """Compute all /api/insights data deterministically from SQL."""
+async def _get_cached_insights(pool, days: int, ttl_hours: int = 1) -> dict | None:
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT insights_json FROM mzhu_test_insights_cache
+                WHERE days = $1
+                  AND generated_at > now() - make_interval(hours => $2)
+                ORDER BY generated_at DESC LIMIT 1
+                """,
+                days, ttl_hours,
+            )
+        if row:
+            data = row["insights_json"]
+            return json.loads(data) if isinstance(data, str) else data
+        return None
+    except Exception as e:
+        log.warning("insights cache read failed: %s", e)
+        return None
+
+
+async def _persist_insights(pool, days: int, insights: dict) -> None:
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO mzhu_test_insights_cache (days, insights_json) VALUES ($1, $2::jsonb)",
+                days, json.dumps(insights, default=str),
+            )
+            await conn.execute(
+                "DELETE FROM mzhu_test_insights_cache WHERE generated_at < now() - interval '24 hours'",
+            )
+    except Exception as e:
+        log.warning("insights cache write failed: %s", e)
+
+
+async def fetch_insights(pool, days: int, refresh: bool = False) -> dict:
+    """Compute all /api/insights data deterministically from SQL, with 1h cache."""
+    if not refresh:
+        cached = await _get_cached_insights(pool, days)
+        if cached:
+            return {**cached, "cached": True}
+
     async with pool.acquire() as conn:
 
         # ── log count + date range ────────────────────────────────────────────
@@ -147,6 +187,7 @@ async def fetch_insights(pool, days: int) -> dict:
             SELECT outcome, COUNT(*) AS cnt
             FROM mzhu_test_logs
             WHERE logged_at >= now() - $1 * interval '1 day' AND NOT voided
+              AND outcome IS NOT NULL
             GROUP BY outcome
             ORDER BY cnt DESC
             """,
@@ -160,6 +201,7 @@ async def fetch_insights(pool, days: int) -> dict:
                 SELECT unnest(triggers) AS trigger, outcome
                 FROM mzhu_test_logs
                 WHERE logged_at >= now() - $1 * interval '1 day' AND NOT voided
+                  AND outcome IS NOT NULL
             ),
             trigger_totals AS (
                 SELECT trigger, COUNT(*)::int AS total
@@ -280,7 +322,7 @@ async def fetch_insights(pool, days: int) -> dict:
     check_data  = await fetch_check_averages(pool, from_date, to_date)
     correlation = await fetch_low_sleep_correlation(pool, from_date, to_date)
 
-    return {
+    result = {
         "top_triggers":              top_triggers,
         "top_outcomes":              top_outcomes,
         "patterns":                  patterns,
@@ -294,4 +336,8 @@ async def fetch_insights(pool, days: int) -> dict:
             **check_data,
             "low_sleep_meltdown_correlation": correlation,
         },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cached":       False,
     }
+    await _persist_insights(pool, days, result)
+    return result

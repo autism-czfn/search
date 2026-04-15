@@ -247,6 +247,7 @@ async def health(pool=Depends(get_pool)):
 @router.get("/insights", response_model=InsightsResponse)
 async def insights(
     days: int = Query(default=30, ge=1, description="Lookback window in days"),
+    refresh: bool = Query(default=False, description="Bypass cache and recompute"),
     user_pool=Depends(get_user_pool),
 ):
     """
@@ -255,11 +256,12 @@ async def insights(
     Returns top triggers, top outcomes, co-occurrence patterns with
     confidence levels, and intervention effectiveness (meltdown rates
     before/after each adopted intervention).
+    Cached for 1 hour; pass ?refresh=true to force recomputation.
     """
     if user_pool is None:
         raise HTTPException(status_code=503, detail="User database not configured (USER_DATABASE_URL missing)")
     try:
-        return await fetch_insights(user_pool, days)
+        return await fetch_insights(user_pool, days, refresh=refresh)
     except Exception as e:
         log.error("insights error: %s", e, exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "insights query failed", "detail": str(e)})
@@ -288,6 +290,7 @@ async def weekly_summary(user_pool=Depends(get_user_pool)):
 @router.get("/clinician-report", response_model=ClinicianReportResponse)
 async def clinician_report(
     days: int = Query(default=90, ge=1, description="Lookback window in days (default 3 months)"),
+    refresh: bool = Query(default=False, description="Bypass cache and regenerate report"),
     pool=Depends(get_pool),
     user_pool=Depends(get_user_pool),
 ):
@@ -295,11 +298,12 @@ async def clinician_report(
     Structured report for a medical appointment.
     Deterministic stats + LLM-narrated 'Key concerns' section grounded
     in the stats and top 3 evidence results for the most frequent trigger.
+    Cached for 2 hours; pass ?refresh=true to force regeneration.
     """
     if user_pool is None:
         raise HTTPException(status_code=503, detail="User database not configured (USER_DATABASE_URL missing)")
     try:
-        return await get_clinician_report(user_pool, pool, days)
+        return await get_clinician_report(user_pool, pool, days, refresh=refresh)
     except Exception as e:
         log.error("clinician-report error: %s", e, exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "clinician report failed", "detail": str(e)})

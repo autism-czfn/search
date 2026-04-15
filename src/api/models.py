@@ -179,6 +179,8 @@ class InsightsResponse(BaseModel):
     log_count: int
     date_range: dict[str, Any]
     daily_check_trends: DailyCheckTrends
+    generated_at: str = ""
+    cached: bool = False
 
 
 class WeeklySummaryResponse(BaseModel):
@@ -205,3 +207,4 @@ class ClinicianReportResponse(BaseModel):
     daily_check_summary: DailyCheckSummary | None = None
     key_concerns_text: str | None
     generated_at: str
+    cached: bool = False

@@ -79,12 +79,12 @@ LOG_LEVEL=INFO
 ./setup.sh
 ```
 
-选择 `1) Start / Restart service`，服务将在端口 **3001** 启动。
+选择 `1) Start / Restart service`，服务将在端口 **3002** 启动。
 
 或直接运行：
 
 ```bash
-uvicorn src.main:app --reload --port 3001
+uvicorn src.main:app --reload --port 3002
 ```
 
 ---
@@ -102,7 +102,7 @@ uvicorn src.main:app --reload --port 3001
 
 **请求示例：**
 ```bash
-curl "http://localhost:3001/api/search?q=自闭症症状&source=pubmed&days=90"
+curl "http://localhost:3002/api/search?q=自闭症症状&source=pubmed&days=90"
 ```
 
 **返回示例：**
@@ -138,7 +138,7 @@ curl "http://localhost:3001/api/search?q=自闭症症状&source=pubmed&days=90"
 ### `GET /api/stats` — 数据库统计
 
 ```bash
-curl "http://localhost:3001/api/stats"
+curl "http://localhost:3002/api/stats"
 ```
 
 ```json
@@ -159,7 +159,7 @@ curl "http://localhost:3001/api/stats"
 ### `GET /api/health` — 健康检查
 
 ```bash
-curl "http://localhost:3001/api/health"
+curl "http://localhost:3002/api/health"
 ```
 
 ```json
