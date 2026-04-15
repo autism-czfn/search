@@ -5,6 +5,14 @@ APP="src.main:app"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIDFILE="$SCRIPT_DIR/.uvicorn.pid"
 LOGFILE="$SCRIPT_DIR/uvicorn.log"
+CERT_DIR="$SCRIPT_DIR/../certs"
+CERT_FILE="$CERT_DIR/cert.pem"
+KEY_FILE="$CERT_DIR/key.pem"
+ENV_FILE="$SCRIPT_DIR/.env"
+ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
+VENV_DIR="/home/test/.virtualenvs/search"
+VENV_PIP="$VENV_DIR/bin/pip"
+VENV_UVICORN="$VENV_DIR/bin/uvicorn"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -48,11 +56,17 @@ start_service() {
         done
     fi
 
-    CERT_DIR="$SCRIPT_DIR/../certs"
-    VENV_UVICORN="/home/test/.virtualenvs/search/bin/uvicorn"
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ] || [ ! -f "$ENV_FILE" ]; then
+        echo "  ⚠️   Missing prerequisites (cert and/or .env)"
+        echo "      Run option 5 first to set them up."
+        echo ""
+        return
+    fi
+
+    cd "$SCRIPT_DIR" || return
     nohup "$VENV_UVICORN" "$APP" --host 0.0.0.0 --port "$PORT" \
-        --ssl-certfile "$CERT_DIR/cert.pem" \
-        --ssl-keyfile  "$CERT_DIR/key.pem" \
+        --ssl-certfile "$CERT_FILE" \
+        --ssl-keyfile  "$KEY_FILE" \
         > "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 1
@@ -106,6 +120,87 @@ stop_service() {
     echo ""
 }
 
+setup_cert() {
+    echo ""
+    echo "  ── Step 1/3: Self-signed cert ──"
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "  ❌  openssl not found — please install it first"
+        echo ""
+        return
+    fi
+
+    mkdir -p "$CERT_DIR"
+
+    local do_gen=1
+    if [ -f "$CERT_FILE" ] || [ -f "$KEY_FILE" ]; then
+        printf "  ⚠️   Cert already exists at $CERT_DIR — overwrite? [y/N]: "
+        read -r confirm
+        case "$confirm" in
+            y|Y|yes|YES) ;;
+            *) do_gen=0 ;;
+        esac
+    fi
+
+    if [ "$do_gen" = "1" ]; then
+        local ip
+        ip=$(get_local_ip)
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$KEY_FILE" -out "$CERT_FILE" \
+            -days 365 -subj "/CN=$ip" \
+            -addext "subjectAltName=IP:$ip,IP:127.0.0.1,DNS:localhost" \
+            >/dev/null 2>&1
+
+        if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+            chmod 600 "$KEY_FILE"
+            echo "  ✅  Self-signed cert generated"
+            echo "      cert: $CERT_FILE"
+            echo "      key:  $KEY_FILE"
+        else
+            echo "  ❌  Failed to generate cert"
+            echo ""
+            return
+        fi
+    else
+        echo "  ↪  Kept existing cert."
+    fi
+
+    echo ""
+    echo "  ── Step 2/3: .env file ──"
+    if [ -f "$ENV_FILE" ]; then
+        echo "  ↪  $ENV_FILE already exists — kept."
+    elif [ -f "$ENV_EXAMPLE" ]; then
+        cp "$ENV_EXAMPLE" "$ENV_FILE"
+        echo "  ✅  Created $ENV_FILE from .env.example"
+        echo "  ✏️   Edit it to set DATABASE_URL and other values."
+    else
+        echo "  ❌  $ENV_EXAMPLE not found — cannot create .env"
+        echo ""
+        return
+    fi
+
+    echo ""
+    echo "  ── Step 3/3: pip install -r requirements.txt ──"
+    if [ ! -x "$VENV_PIP" ]; then
+        echo "  ❌  venv pip not found at $VENV_PIP"
+        echo ""
+        return
+    fi
+    if [ ! -f "$SCRIPT_DIR/requirements.txt" ]; then
+        echo "  ❌  requirements.txt not found in $SCRIPT_DIR"
+        echo ""
+        return
+    fi
+
+    "$VENV_PIP" install -r "$SCRIPT_DIR/requirements.txt"
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "  ✅  Dependencies installed"
+    else
+        echo "  ❌  pip install failed (exit $rc)"
+    fi
+    echo ""
+}
+
 show_api_url() {
     echo ""
     local ip
@@ -133,6 +228,7 @@ while true; do
     echo "║  2) Stop service                 ║"
     echo "║  3) Service status               ║"
     echo "║  4) Show API URL                 ║"
+    echo "║  5) Setup cert / .env / deps     ║"
     echo "║  0) Exit                         ║"
     echo "╚══════════════════════════════════╝"
     printf "  Choose an option: "
@@ -143,6 +239,7 @@ while true; do
         2) stop_service ;;
         3) service_status ;;
         4) show_api_url ;;
+        5) setup_cert ;;
         0) echo ""; echo "  Bye!"; echo ""; exit 0 ;;
         *) echo ""; echo "  ⚠️  Invalid option, try again."; echo "" ;;
     esac
