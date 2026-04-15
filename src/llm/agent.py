@@ -50,14 +50,21 @@ def _write_temp_file(results: list[dict]) -> Path:
     return tmp_path
 
 
-def _build_prompt(query: str, tmp_path: Path, python_exe: str) -> str:
+def _build_prompt(
+    query: str,
+    tmp_path: Path,
+    python_exe: str,
+    log_context: str | None = None,
+) -> str:
     """
     Build the claude -p prompt. Instructs Claude to:
       1. Read the temp JSON file using its built-in Read tool
       2. Optionally call CLI search tools via Bash if results are weak
       3. Produce a 3–6 sentence answer citing sources by number
     """
-    return (
+    from ..safety import SAFETY_PROMPT
+
+    prompt = (
         "You are a medical and scientific information assistant specialising in autism (ASD).\n\n"
         f"User question: {query}\n\n"
         f"Initial search results are in the file: {tmp_path}\n"
@@ -65,6 +72,17 @@ def _build_prompt(query: str, tmp_path: Path, python_exe: str) -> str:
         "If those results do not fully answer the question, you may call these CLI tools via Bash:\n"
         f"  {python_exe} -m src.tools.search \"<query>\"   — hybrid local DB search\n"
         f"  {python_exe} -m src.tools.pubmed \"<query>\"   — live PubMed search\n\n"
+    )
+
+    if log_context:
+        prompt += (
+            f"User's recent log context (last 30 days):\n{log_context}\n"
+            "Where relevant, reference this data in your answer using phrases like "
+            "'in your child's case' or 'your logs show'.\n\n"
+        )
+
+    prompt += (
+        f"{SAFETY_PROMPT}\n\n"
         "Guidelines:\n"
         "  - Strongly prefer authoritative sources (PubMed, CDC, NIH, WHO, medical journals)\n"
         "  - Cite sources by number [1], [2], etc.\n"
@@ -73,6 +91,7 @@ def _build_prompt(query: str, tmp_path: Path, python_exe: str) -> str:
         "  - If only community sources are available, note that official sources were not found\n\n"
         "Produce your final answer now."
     )
+    return prompt
 
 
 async def run_agent(
@@ -80,6 +99,7 @@ async def run_agent(
     initial_results: list[dict],
     pool,               # not used directly — CLI tools create their own pool
     fetch_limit: int = 10,
+    log_context: str | None = None,
 ) -> tuple[str | None, int]:
     """
     Run the enhanced claude -p agent loop.
@@ -96,7 +116,7 @@ async def run_agent(
     tmp_path: Path | None = None
     try:
         tmp_path = _write_temp_file(initial_results)
-        prompt   = _build_prompt(query, tmp_path, sys.executable)
+        prompt   = _build_prompt(query, tmp_path, sys.executable, log_context)
 
         env = os.environ.copy()
         # Claude Code sets CLAUDECODE=1 to detect when it is already running

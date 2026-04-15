@@ -69,6 +69,16 @@ class SearchResponse(BaseModel):
             "summarize())."
         ),
     )
+    confidence_level: str | None = Field(
+        None,
+        description=(
+            '"strong_pattern" | "possible_pattern" | "insufficient_data" | null. '
+            "Set by /api/insights pattern endpoint only; always null on /api/search."
+        ),
+    )
+    safety_flag: bool = Field(
+        False, description="True if a safety keyword was detected in the query."
+    )
 
 
 class StatsResponse(BaseModel):
@@ -82,3 +92,73 @@ class StatsResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str   # "ok" | "error"
     db: str       # "connected" | "unreachable"
+
+
+# ── Analytics response models ─────────────────────────────────────────────────
+
+class TriggerCount(BaseModel):
+    trigger: str
+    count: int
+    pct: float
+
+
+class OutcomeCount(BaseModel):
+    outcome: str
+    count: int
+    pct: float
+
+
+class PatternEntry(BaseModel):
+    trigger: str
+    outcome: str
+    co_occurrence_count: int
+    co_occurrence_pct: float
+    total_trigger_events: int
+    confidence_level: str
+    sample_count: int
+
+
+class InterventionEffectiveness(BaseModel):
+    intervention_id: str
+    suggestion_text: str
+    started_at: str
+    meltdown_rate_before: float
+    meltdown_rate_after: float
+    delta: float
+    observation_days_before: int
+    observation_days_after: int
+    confidence_level: str
+
+
+class InsightsResponse(BaseModel):
+    top_triggers: list[TriggerCount]
+    top_outcomes: list[OutcomeCount]
+    patterns: list[PatternEntry]
+    intervention_effectiveness: list[InterventionEffectiveness]
+    log_count: int
+    date_range: dict[str, Any]
+
+
+class WeeklySummaryResponse(BaseModel):
+    week_start: str
+    week_end: str
+    stats: dict[str, Any]
+    summary_text: str
+    generated_at: str
+    cached: bool
+
+
+class EventFrequency(BaseModel):
+    total: int
+    per_week: list[dict[str, Any]]
+
+
+class ClinicianReportResponse(BaseModel):
+    date_range: dict[str, Any]
+    event_frequency: EventFrequency
+    top_triggers: list[TriggerCount]
+    top_outcomes: list[OutcomeCount]
+    patterns: list[PatternEntry]
+    intervention_outcomes: list[InterventionEffectiveness]
+    key_concerns_text: str | None
+    generated_at: str

@@ -168,14 +168,43 @@ setup_cert() {
     echo "  ── Step 2/3: .env file ──"
     if [ -f "$ENV_FILE" ]; then
         echo "  ↪  $ENV_FILE already exists — kept."
-    elif [ -f "$ENV_EXAMPLE" ]; then
-        cp "$ENV_EXAMPLE" "$ENV_FILE"
-        echo "  ✅  Created $ENV_FILE from .env.example"
-        echo "  ✏️   Edit it to set DATABASE_URL and other values."
     else
-        echo "  ❌  $ENV_EXAMPLE not found — cannot create .env"
+        if [ ! -f "$ENV_EXAMPLE" ]; then
+            echo "  ❌  $ENV_EXAMPLE not found — cannot create .env"
+            echo ""
+            return
+        fi
+
+        echo "  Two databases are required:"
+        echo "    1) Crawled content DB  (DATABASE_URL)      — stores crawled_items & embeddings"
+        echo "    2) User data DB        (USER_DATABASE_URL) — stores mzhu_test_ logs/interventions (collect repo)"
         echo ""
-        return
+
+        echo "  -- Crawled content DB --"
+        printf "    host     [localhost]: "; read -r db_host;   db_host="${db_host:-localhost}"
+        printf "    port     [5432]:      "; read -r db_port;   db_port="${db_port:-5432}"
+        printf "    user     [dbuser]:    "; read -r db_user;   db_user="${db_user:-dbuser}"
+        printf "    password:             "; read -rs db_pass;  echo ""
+        printf "    database [autism_crawler]: "; read -r db_name; db_name="${db_name:-autism_crawler}"
+        db_url="postgresql://${db_user}:${db_pass}@${db_host}:${db_port}/${db_name}"
+
+        echo ""
+        echo "  -- User data DB (collect) --"
+        printf "    host     [localhost]: "; read -r udb_host;  udb_host="${udb_host:-localhost}"
+        printf "    port     [5432]:      "; read -r udb_port;  udb_port="${udb_port:-5432}"
+        printf "    user     [dbuser]:    "; read -r udb_user;  udb_user="${udb_user:-dbuser}"
+        printf "    password:             "; read -rs udb_pass; echo ""
+        printf "    database [mzhu_test_autism_users]: "; read -r udb_name; udb_name="${udb_name:-mzhu_test_autism_users}"
+        user_db_url="postgresql://${udb_user}:${udb_pass}@${udb_host}:${udb_port}/${udb_name}"
+
+        cp "$ENV_EXAMPLE" "$ENV_FILE"
+        sed -i "s|^DATABASE_URL=.*|DATABASE_URL=$db_url|" "$ENV_FILE"
+        sed -i "s|^USER_DATABASE_URL=.*|USER_DATABASE_URL=$user_db_url|" "$ENV_FILE"
+
+        echo "  ✅  Created $ENV_FILE"
+        echo "      DATABASE_URL      = postgresql://${db_user}:****@${db_host}:${db_port}/${db_name}"
+        echo "      USER_DATABASE_URL = postgresql://${udb_user}:****@${udb_host}:${udb_port}/${udb_name}"
+        echo "  ✏️   Edit $ENV_FILE to adjust other values (COLLECT_BASE_URL, LOG_LEVEL, etc.)"
     fi
 
     echo ""

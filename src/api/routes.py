@@ -16,13 +16,21 @@ from fastapi.responses import StreamingResponse
 
 from ..config import settings
 from ..db import get_pool
+from ..user_db import get_user_pool
 from ..embedder import embed_query
 from ..search.keyword import keyword_search
 from ..search.semantic import semantic_search
 from ..search.hybrid import merge_and_rerank
 from ..llm.agent import run_agent
 from ..llm.summarize import summarize
-from .models import SearchResponse, SearchResult, StatsResponse, HealthResponse
+from ..safety import check_safety
+from ..analytics.patterns import fetch_log_context, fetch_insights
+from ..analytics.summary import get_weekly_summary
+from ..analytics.clinician import get_clinician_report
+from .models import (
+    SearchResponse, SearchResult, StatsResponse, HealthResponse,
+    InsightsResponse, WeeklySummaryResponse, ClinicianReportResponse,
+)
 from .stream import search_stream_generator
 
 log = logging.getLogger(__name__)
@@ -42,6 +50,7 @@ async def search(
     source: str | None = Query(default=None, description="Filter by source (e.g. reddit, pubmed)"),
     days: int | None = Query(default=None, ge=1, description="Only items published within N days"),
     pool=Depends(get_pool),
+    user_pool=Depends(get_user_pool),
 ):
     effective_limit = min(
         limit if limit is not None else settings.default_result_limit,
@@ -79,6 +88,7 @@ async def search(
             search_time_ms=elapsed_ms,
             summary=None,
             llm_time_ms=None,
+            safety_flag=check_safety(q),
         )
 
     # Step 4: merge + rerank
@@ -88,33 +98,46 @@ async def search(
 
     elapsed_ms = int((t4 - t0) * 1000)
 
+    # Step 5b: safety detection (deterministic — runs before LLM)
+    safety_flag = check_safety(q)
+    log.info("search SAFETY flag=%s q=%r", safety_flag, q)
+
+    # Step 5c: personalization context (skip if user DB unavailable or < 5 logs)
+    log_context: str | None = None
+    if user_pool is not None:
+        try:
+            log_context = await fetch_log_context(user_pool)
+        except Exception as e:
+            log.warning("search: failed to fetch log context: %s", e)
+
     # Step 5: run enhanced agent (claude -p with Read + Bash tools)
     t_llm = time.monotonic()
     agent_iterations: int | None = None
-    summary: str | None = None
+    summary_text: str | None = None
 
     agent_summary, agent_iters = await run_agent(
         query=q,
         initial_results=merged[:5],
         pool=pool,
         fetch_limit=fetch_limit,
+        log_context=log_context,
     )
     llm_ms = int((time.monotonic() - t_llm) * 1000)
 
     if agent_summary is not None:
-        summary = agent_summary
+        summary_text = agent_summary
         agent_iterations = agent_iters
         log.info("search LLM agent OK elapsed=%dms", llm_ms)
     else:
         # Fallback to single-shot claude -p summarize()
         log.info("search LLM agent failed/skipped — falling back to summarize()")
-        summary = await summarize(q, merged[:5])
+        summary_text = await summarize(q, merged[:5], log_context)
         llm_ms = int((time.monotonic() - t_llm) * 1000)
-        log.info("search LLM summarize ok=%s elapsed=%dms", summary is not None, llm_ms)
+        log.info("search LLM summarize ok=%s elapsed=%dms", summary_text is not None, llm_ms)
 
     log.info(
-        "search COMPLETE q=%r mode=%s results=%d search=%dms llm=%dms",
-        q, mode, len(merged), elapsed_ms, llm_ms,
+        "search COMPLETE q=%r mode=%s results=%d search=%dms llm=%dms safety=%s",
+        q, mode, len(merged), elapsed_ms, llm_ms, safety_flag,
     )
 
     return SearchResponse(
@@ -122,9 +145,10 @@ async def search(
         total=len(merged),
         search_mode=mode,
         search_time_ms=elapsed_ms,
-        summary=summary,
-        llm_time_ms=llm_ms if summary is not None else None,
+        summary=summary_text,
+        llm_time_ms=llm_ms if summary_text is not None else None,
         agent_iterations=agent_iterations,
+        safety_flag=safety_flag,
     )
 
 
@@ -137,15 +161,19 @@ async def search_stream(
     source: str | None = Query(default=None, description="Filter by source (e.g. reddit, pubmed)"),
     days: int | None = Query(default=None, ge=1, description="Only items published within N days"),
     pool=Depends(get_pool),
+    user_pool=Depends(get_user_pool),
 ):
     """
     Streaming variant of /api/search — returns Server-Sent Events.
 
     Event sequence:
-      stage (×4-5) → results → agent_activity (×0-N) → summary → done
+      metadata × 1     (safety_flag — emitted immediately before any LLM content)
+      stage    × 4-5   (embedding → semantic → keyword → merge → agent)
+      results  × 1     (source cards — sent BEFORE the LLM runs)
+      agent_activity × 0-N
+      summary  × 0-1
+      done     × 1
 
-    The `results` event arrives before the LLM runs, so the browser can
-    render source cards immediately while the agent composes the answer.
     Falls back through two tiers: streaming agent → single-shot summarize(),
     so the UI always receives a summary event unless the database itself
     is unavailable.
@@ -159,7 +187,7 @@ async def search_stream(
         q, effective_limit, source, days,
     )
     return StreamingResponse(
-        search_stream_generator(q, effective_limit, source, days, pool),
+        search_stream_generator(q, effective_limit, source, days, pool, user_pool),
         media_type="text/event-stream",
         headers={
             "Cache-Control":     "no-cache",
@@ -212,3 +240,66 @@ async def health(pool=Depends(get_pool)):
     except Exception as e:
         log.error("Health check DB error: %s", e)
         raise HTTPException(status_code=503, detail={"status": "error", "db": "unreachable"})
+
+
+# ── /api/insights ─────────────────────────────────────────────────────────────
+
+@router.get("/insights", response_model=InsightsResponse)
+async def insights(
+    days: int = Query(default=30, ge=1, description="Lookback window in days"),
+    user_pool=Depends(get_user_pool),
+):
+    """
+    Deterministic analytics over mzhu_test_logs.
+    No LLM — all values are SQL aggregates.
+    Returns top triggers, top outcomes, co-occurrence patterns with
+    confidence levels, and intervention effectiveness (meltdown rates
+    before/after each adopted intervention).
+    """
+    if user_pool is None:
+        raise HTTPException(status_code=503, detail="User database not configured (USER_DATABASE_URL missing)")
+    try:
+        return await fetch_insights(user_pool, days)
+    except Exception as e:
+        log.error("insights error: %s", e, exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "insights query failed", "detail": str(e)})
+
+
+# ── /api/weekly-summary ───────────────────────────────────────────────────────
+
+@router.get("/weekly-summary", response_model=WeeklySummaryResponse)
+async def weekly_summary(user_pool=Depends(get_user_pool)):
+    """
+    Generates (or returns cached) weekly summary for the current week.
+    Cached for 24 hours in mzhu_test_summaries.
+    LLM narrates pre-computed stats — does not invent numbers.
+    """
+    if user_pool is None:
+        raise HTTPException(status_code=503, detail="User database not configured (USER_DATABASE_URL missing)")
+    try:
+        return await get_weekly_summary(user_pool, settings.collect_base_url)
+    except Exception as e:
+        log.error("weekly-summary error: %s", e, exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "weekly summary failed", "detail": str(e)})
+
+
+# ── /api/clinician-report ─────────────────────────────────────────────────────
+
+@router.get("/clinician-report", response_model=ClinicianReportResponse)
+async def clinician_report(
+    days: int = Query(default=90, ge=1, description="Lookback window in days (default 3 months)"),
+    pool=Depends(get_pool),
+    user_pool=Depends(get_user_pool),
+):
+    """
+    Structured report for a medical appointment.
+    Deterministic stats + LLM-narrated 'Key concerns' section grounded
+    in the stats and top 3 evidence results for the most frequent trigger.
+    """
+    if user_pool is None:
+        raise HTTPException(status_code=503, detail="User database not configured (USER_DATABASE_URL missing)")
+    try:
+        return await get_clinician_report(user_pool, pool, days)
+    except Exception as e:
+        log.error("clinician-report error: %s", e, exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "clinician report failed", "detail": str(e)})

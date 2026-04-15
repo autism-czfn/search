@@ -14,6 +14,7 @@ from starlette.requests import Request
 
 from .config import settings
 from .db import connect, disconnect, get_pool
+from .user_db import connect_user_db, disconnect_user_db, get_user_pool
 from .api.routes import router
 
 logging.basicConfig(
@@ -40,9 +41,18 @@ async def lifespan(app: FastAPI):
     # ── Startup ──────────────────────────────────────────────────────────────
     pool = await connect(settings.database_url)
     app.state.pool = pool
+
+    app.state.user_pool = None
+    if settings.user_database_url:
+        try:
+            app.state.user_pool = await connect_user_db(settings.user_database_url)
+        except Exception as e:
+            log.warning("User database unavailable (%s) — personalization disabled", e)
+
     yield
     # ── Shutdown ─────────────────────────────────────────────────────────────
     await disconnect()
+    await disconnect_user_db()
 
 
 app = FastAPI(
@@ -65,9 +75,12 @@ app.add_middleware(PrivateNetworkAccessMiddleware)
 app.include_router(router)
 
 
-# Override the get_pool dependency to return app.state.pool
-# This allows Depends(get_pool) in routes to work without global state.
+# Override pool dependencies to return from app.state.
 async def _get_pool_from_state():
     return app.state.pool
 
-app.dependency_overrides[get_pool] = _get_pool_from_state
+async def _get_user_pool_from_state():
+    return getattr(app.state, "user_pool", None)
+
+app.dependency_overrides[get_pool]      = _get_pool_from_state
+app.dependency_overrides[get_user_pool] = _get_user_pool_from_state
