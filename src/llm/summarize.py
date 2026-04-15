@@ -62,7 +62,7 @@ async def summarize(query: str, results: list[dict]) -> str | None:
         log.info("summarize LAUNCH claude -p (timeout=%ds prompt_chars=%d)", SUMMARY_TIMEOUT, len(prompt))
         t0 = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
-            "claude", "-p", prompt,
+            "claude", "--bare", "--disable-slash-commands", "-p", prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,

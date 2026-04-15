@@ -167,6 +167,7 @@ async def run_agent_stream(
         log.info("agent_stream LAUNCH claude -p stream-json (timeout=%ds)", AGENT_TIMEOUT)
         proc = await asyncio.create_subprocess_exec(
             "claude",
+            "--bare", "--disable-slash-commands",
             "--dangerously-skip-permissions",
             "--allowedTools", "Read,Bash",
             STREAM_JSON_FLAG, STREAM_JSON_VAL,
