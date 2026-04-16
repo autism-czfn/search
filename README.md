@@ -89,7 +89,7 @@ NCBI_API_KEY=               # 可选：PubMed E-utilities 配额
 或直接跑 uvicorn（HTTPS）：
 
 ```bash
-uvicorn src.main:app --host 0.0.0.0 --port 3002 \
+uvicorn src.main:app --host 0.0.0.0 --port 3001 \
   --ssl-certfile ../certs/cert.pem \
   --ssl-keyfile  ../certs/key.pem
 ```
