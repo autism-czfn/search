@@ -1,195 +1,199 @@
 # Autism Search 自闭症内容搜索服务
 
-基于 PostgreSQL + pgvector 的混合搜索 REST API，支持语义搜索与关键词搜索，覆盖多来源自闭症相关内容。 
+基于 PostgreSQL + pgvector 的混合搜索 REST API，在语义 + 关键词检索之上叠加 `claude -p` 智能体回答、SSE 流式响应、家长日志个性化、以及围绕 `mzhu_test_*` 表的分析报告（洞察、周报、临床报告）。
 
 ---
 
 ## 功能概述
 
-- **语义搜索**：将查询文本转换为向量，通过余弦相似度在数据库中匹配最相关内容
-- **关键词搜索**：基于 PostgreSQL 全文检索（tsvector）进行精确匹配
-- **混合模式**：同时运行两种搜索，归一化评分后加权合并，返回最优排名结果
-- **AI 摘要**：调用 `claude -p` 对搜索结果自动生成简洁摘要
-- **多源支持**：涵盖 PubMed、Reddit、DOAJ、ClinicalTrials、CORE 等多个数据来源
+- **混合搜索**：`fastembed` 向量相似度 + PostgreSQL 全文检索，归一化评分后加权合并
+- **Claude 智能体回答**：调用 `claude -p`，开放 `Read + Bash` 工具；智能体可读入预取结果的临时 JSON 文件，必要时自主调用 CLI 搜索工具继续迭代
+- **流式响应**：`/api/search/stream` 基于 SSE 分阶段推送 `metadata → stage → results → agent_activity → summary → done`
+- **个性化上下文**：从用户 DB 中读取近 30 天日志与每日检查，拼成精简上下文注入 LLM 提示
+- **安全检测**：两层策略——确定性关键字 gate（`check_safety`）+ 提示词注入让 Claude 以 `⚠ SAFETY:` 前缀响应
+- **分析接口**：`/api/insights`、`/api/weekly-summary`、`/api/clinician-report` 三个围绕 `mzhu_test_logs / _interventions / _daily_checks / _summaries` 的端点，全部走 SQL 聚合 + LLM 叙述，结果带缓存
+- **PubMed 直连**：`src.tools.pubmed` 封装 E-utilities，智能体可在本地库证据不足时实时查询
+- **HTTPS + Chrome PNA**：`setup.sh` 生成自签证书，`PrivateNetworkAccessMiddleware` 为公网页面访问内网 API 放行
 
 ---
 
-## 搜索原理
-
-### 第一步：语义搜索
-
-用户查询文本通过本地 `fastembed` 模型（`nomic-ai/nomic-embed-text-v1.5`）转换为 768 维向量，与数据库中预存的文章向量进行余弦距离计算，找出语义最接近的内容。
+## 搜索流水线
 
 ```
-用户查询 → fastembed → 向量[768] → pgvector 余弦相似度查询 → 语义结果
+query
+  │
+  ├─► fastembed  (nomic-ai/nomic-embed-text-v1.5, 768d)
+  │       └─► pgvector 余弦相似度
+  │
+  ├─► PostgreSQL tsvector 全文检索
+  │
+  ▼
+merge_and_rerank  (归一化 + 加权)
+        combined = 0.7 × semantic + 0.3 × keyword
+  │
+  ▼
+safety check  +  fetch_log_context  (用户 DB, ≥5 条日志才注入)
+  │
+  ▼
+run_agent  (claude -p, Read+Bash, 60s 超时)
+  │   └─ 读 /tmp/autism_agent_<uuid>.json
+  │   └─ 按需调用  python -m src.tools.search | src.tools.pubmed
+  │
+  └─► (失败回退) summarize()  ← 单次 claude -p
 ```
 
-### 第二步：关键词搜索
+若语义向量不可用（`embed_query` 返回 None），自动降级为 `keyword_only` 模式。
 
-同时对 `title`、`description`、`content_body` 三个字段执行 PostgreSQL 全文检索，基于词频和相关性打分排序。
-
-```
-用户查询 → PostgreSQL tsvector @@ tsquery → 关键词结果
-```
-
-### 第三步：混合合并与重排
-
-将两组结果合并去重，分别对语义分数和关键词分数进行归一化（0~1），按以下权重计算最终分数：
-
-```
-combined_score = 0.7 × semantic_score + 0.3 × keyword_score
-```
-
-若语义搜索不可用（向量未生成），自动降级为纯关键词模式。
-
-### 第四步：AI 摘要
-
-取排名前 5 的结果，调用 `claude -p` 生成 2~4 句话的综合摘要，随搜索结果一并返回。若 Claude 调用失败，仍正常返回搜索结果，摘要字段为 `null`。
+流式端点 `/api/search/stream` 使用 `run_agent_stream`，会额外把 Claude 的每次工具调用转为 `agent_activity` 事件推送给前端。
 
 ---
 
 ## 快速开始
 
-### 安装依赖
+### 1. 准备虚拟环境与依赖
+
+`setup.sh` 假设虚拟环境在 `/home/test/.virtualenvs/search`。菜单选项 `5) Setup cert / .env / deps` 会一次性完成：
+- 生成自签证书到 `../certs/{cert,key}.pem`
+- 交互式创建 `.env`（同时配置 `DATABASE_URL` 和 `USER_DATABASE_URL`）
+- `pip install -r requirements.txt`
+
+也可以手动安装：
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env        # 然后编辑
 ```
 
-### 配置环境变量
-
-复制配置模板并填写数据库地址：
-
-```bash
-cp .env.example .env
-```
-
-编辑 `.env`：
+### 2. 环境变量（`.env`）
 
 ```
-DATABASE_URL=postgresql://用户名:密码@localhost:5432/autism_crawler
+DATABASE_URL=postgresql://user:pass@localhost:5432/autism_crawler
+USER_DATABASE_URL=postgresql://user:pass@localhost:5432/autism_users
+COLLECT_BASE_URL=https://localhost:18001
 DEFAULT_RESULT_LIMIT=10
 MAX_RESULT_LIMIT=50
 LOG_LEVEL=INFO
+NCBI_API_KEY=               # 可选：PubMed E-utilities 配额
 ```
 
-### 启动服务
+- `DATABASE_URL` — 爬虫库，读取 `crawled_items`、`embedding` 等
+- `USER_DATABASE_URL` — 用户库，读取 `mzhu_test_logs / _interventions / _daily_checks / _insights_cache / _summaries`；留空则个性化与分析端点全部降级为 503
+- `COLLECT_BASE_URL` — collect 服务地址，周报生成后 POST 回写
+
+### 3. 启动服务
 
 ```bash
-./setup.sh
+./setup.sh      # 菜单驱动：start / stop / status / url / setup
 ```
 
-选择 `1) Start / Restart service`，服务将在端口 **3001** 启动。
-
-或直接运行：
+或直接跑 uvicorn（HTTPS）：
 
 ```bash
-uvicorn src.main:app --reload --port 3001
+uvicorn src.main:app --host 0.0.0.0 --port 3002 \
+  --ssl-certfile ../certs/cert.pem \
+  --ssl-keyfile  ../certs/key.pem
 ```
+
+Swagger 文档：`https://<host>:3002/docs`
 
 ---
 
 ## API 接口
 
-### `GET /api/search` — 搜索
+所有路由都挂在 `/api` 前缀下。
+
+### `GET /api/search`
+
+同步接口，返回完整 JSON（含 LLM 摘要）。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `q` | string | ✅ | 搜索关键词 |
-| `limit` | int | 否 | 返回条数（默认 10，最多 50）|
-| `source` | string | 否 | 按来源过滤（如 `pubmed`、`reddit`）|
-| `days` | int | 否 | 只返回最近 N 天内发布的内容 |
+| `q` | string | ✅ | 查询文本 |
+| `limit` | int |  | 返回条数（默认 10，最多 50）|
+| `source` | string |  | 按来源过滤（如 `pubmed`、`reddit`）|
+| `days` | int |  | 只返回最近 N 天内发布的内容 |
 
-**请求示例：**
-```bash
-curl "http://localhost:3001/api/search?q=自闭症症状&source=pubmed&days=90"
+返回体包含 `results`、`search_mode`（`hybrid` / `keyword_only`）、`search_time_ms`、`summary`、`llm_time_ms`、`agent_iterations`、`safety_flag`。
+
+### `GET /api/search/stream`
+
+相同参数，返回 `text/event-stream`。事件序列：
+
+```
+metadata       × 1    (safety_flag)
+stage          × 4-5  (embedding → semantic → keyword → merge → agent)
+results        × 1    (搜索卡片，先于 LLM 发送)
+agent_activity × 0-N  (智能体每次工具调用)
+summary        × 0-1  (最终答案；两层回退后仍可能缺失)
+done           × 1    (总耗时 / agent_iterations / llm_time_ms)
 ```
 
-**返回示例：**
-```json
-{
-  "results": [
-    {
-      "id": 429,
-      "source": "pubmed",
-      "title": "Social Difficulties in Youth with Autism...",
-      "url": "https://pubmed.ncbi.nlm.nih.gov/...",
-      "description": "...",
-      "published_at": "2024-03-15T00:00:00Z",
-      "semantic_score": 0.87,
-      "keyword_score": 0.65,
-      "combined_score": 0.80
-    }
-  ],
-  "total": 10,
-  "search_mode": "hybrid",
-  "search_time_ms": 254,
-  "summary": "自闭症的核心症状包括社交障碍、重复性行为以及感知觉异常...",
-  "llm_time_ms": 9298
-}
-```
+### `GET /api/stats`
 
-`search_mode` 取值：
-- `hybrid`：语义 + 关键词混合模式（推荐）
-- `keyword_only`：纯关键词模式（向量未就绪时自动降级）
+爬虫库统计（总数、已向量化数、按来源分布、最新采集/向量化时间）。
 
----
+### `GET /api/health`
 
-### `GET /api/stats` — 数据库统计
+数据库 ping。
 
-```bash
-curl "http://localhost:3001/api/stats"
-```
+### `GET /api/insights?days=30&refresh=false`
 
-```json
-{
-  "total_items": 58320,
-  "embedded_items": 54100,
-  "items_by_source": {
-    "pubmed": 42000,
-    "reddit": 16320
-  },
-  "last_collected_at": "2026-04-07T22:00:00Z",
-  "last_embedded_at": "2026-04-07T23:00:00Z"
-}
-```
+纯 SQL 聚合洞察，缓存 1 小时（`mzhu_test_insights_cache`）。返回：
+- `top_triggers` / `top_outcomes` — 触发因素与结果分布
+- `patterns` — trigger×outcome 共现率，附 `confidence_level`：`strong_pattern` (≥80% & n≥20) / `possible_pattern` (≥50% & n≥10) / `insufficient_data`
+- `intervention_effectiveness` — 已采纳干预前后 meltdown 发生率对比（最长 14 天窗口）
+- `daily_check_trends` — 每日检查平均值 + 低睡眠日 vs 其他日的 meltdown 相关性
+- `log_count` / `date_range`
 
----
+### `GET /api/weekly-summary`
 
-### `GET /api/health` — 健康检查
+当前自然周的周报，24 小时缓存。先跑 SQL 计算统计，再让 `claude -p` 用自然语言叙述（不允许编造数字），最后 POST 到 collect 做持久化。
 
-```bash
-curl "http://localhost:3001/api/health"
-```
+### `GET /api/clinician-report?days=90&refresh=false`
 
-```json
-{ "status": "ok", "db": "connected" }
-```
+面向就诊的结构化报告，2 小时缓存：
+- 日期范围 + 事件频率（总数 + 分周）
+- Top triggers / outcomes / patterns / 干预效果
+- `daily_check_summary` — 含周趋势
+- `key_concerns_text` — LLM 生成的「关注点」段落，以 SQL 统计 + 最高频 trigger 的 top 3 证据结果为依据
 
 ---
 
 ## 项目结构
 
 ```
-autism-search/
+search/
 ├── src/
+│   ├── main.py                  # FastAPI app + lifespan + PNA 中间件
+│   ├── config.py                # pydantic-settings (.env)
+│   ├── db.py / user_db.py       # asyncpg 连接池（双库）
+│   ├── embedder.py              # fastembed 单例
+│   ├── safety.py                # 两层安全检测
 │   ├── api/
-│   │   ├── models.py        # 请求/响应 Pydantic 数据模型
-│   │   └── routes.py        # FastAPI 路由：/search、/stats、/health
+│   │   ├── routes.py            # /search /stream /stats /health /insights /weekly-summary /clinician-report
+│   │   ├── stream.py            # SSE 生成器
+│   │   └── models.py            # Pydantic 请求/响应
 │   ├── search/
-│   │   ├── semantic.py      # pgvector 语义搜索
-│   │   ├── keyword.py       # PostgreSQL 全文关键词搜索
-│   │   └── hybrid.py        # 归一化、合并、重排
+│   │   ├── semantic.py          # pgvector 余弦相似度
+│   │   ├── keyword.py           # tsvector 全文检索
+│   │   ├── hybrid.py            # 归一化 + 合并重排
+│   │   └── pubmed.py            # PubMed E-utilities 客户端
 │   ├── llm/
-│   │   └── summarize.py     # 调用 claude -p 生成摘要
-│   ├── embedder.py          # fastembed 查询向量化
-│   ├── db.py                # asyncpg 数据库连接池
-│   ├── config.py            # 环境变量配置
-│   └── main.py              # FastAPI 应用入口
-├── setup.sh                 # 服务管理脚本（启动/停止/状态/URL）
-├── requirements.txt         # Python 依赖
-├── pyproject.toml           # 包配置
-└── .env.example             # 环境变量模板
+│   │   ├── agent.py             # claude -p + Read/Bash 智能体
+│   │   ├── agent_stream.py      # SSE 版智能体
+│   │   └── summarize.py         # 单次 claude -p 回退
+│   ├── tools/
+│   │   ├── search.py            # CLI: 本地混合搜索（智能体 Bash 调用）
+│   │   └── pubmed.py            # CLI: 实时 PubMed 搜索
+│   └── analytics/
+│       ├── patterns.py          # /insights + 个性化上下文
+│       ├── summary.py           # /weekly-summary
+│       ├── clinician.py         # /clinician-report
+│       └── daily_checks.py      # mzhu_test_daily_checks SQL 聚合
+├── setup.sh                     # 服务管理 + cert/.env/deps 安装
+├── requirements.txt
+├── pyproject.toml
+└── .env.example
 ```
 
 ---
@@ -198,11 +202,13 @@ autism-search/
 
 | 来源 | 类型 |
 |------|------|
-| PubMed / Europe PMC | 医学学术论文 |
+| PubMed / Europe PMC | 医学学术论文（含实时 E-utilities 查询）|
 | DOAJ / CORE / OpenAlex | 开放获取学术内容 |
-| ClinicalTrials.gov | 临床试验数据 |
-| Reddit | 社区讨论帖子 |
-| bioRxiv / Semantic Scholar | 预印本与引用数据 |
+| ClinicalTrials.gov | 临床试验 |
+| Reddit | 社区讨论 |
+| bioRxiv / Semantic Scholar | 预印本与引用 |
+
+爬取与入库由姊妹项目 `collect` 负责；本服务只读 `crawled_items` 与 `embedding`。
 
 ---
 
@@ -210,9 +216,9 @@ autism-search/
 
 | 包 | 用途 |
 |----|------|
-| `fastapi` | Web 框架 |
-| `uvicorn` | ASGI 服务器 |
-| `asyncpg` | 异步 PostgreSQL 驱动 |
-| `pgvector` | 向量数据类型支持 |
-| `fastembed` | 本地文本向量化（无需 API Key）|
-| `pydantic` | 数据校验与序列化 |
+| `fastapi` / `uvicorn[standard]` | Web 框架与 ASGI 服务器 |
+| `asyncpg` / `pgvector` | PostgreSQL 异步驱动 + 向量类型 |
+| `fastembed` | 本地文本向量化（nomic-embed-text-v1.5，无需 API Key）|
+| `pydantic` / `pydantic-settings` | 数据校验与 `.env` 读取 |
+| `httpx` | PubMed / collect 的异步 HTTP 客户端 |
+| `claude` CLI | 外部依赖——智能体 / 摘要 / 周报 / 临床报告都 shell out 到它，不在 PATH 时自动降级 |

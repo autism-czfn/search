@@ -17,7 +17,13 @@ DESCRIPTION_MAX = 200       # chars per result description in the prompt
 TOP_N = 5                   # max results to include in prompt
 
 
-def _build_prompt(query: str, results: list[dict]) -> str:
+def _build_prompt(
+    query: str,
+    results: list[dict],
+    log_context: str | None = None,
+) -> str:
+    from ..safety import SAFETY_PROMPT
+
     sources = []
     for i, r in enumerate(results[:TOP_N], 1):
         title = r.get("title") or ""
@@ -31,21 +37,30 @@ def _build_prompt(query: str, results: list[dict]) -> str:
 
     sources_text = "\n\n".join(sources)
 
-    return (
+    prompt = (
         "You are a medical and scientific information assistant. "
         "Answer the user's question accurately and concisely using only the provided sources. "
         "Strongly prefer information from official or scientific sources "
         "(e.g. CDC, NIH, PubMed, WHO, medical journals, government health agencies) "
         "over anecdotal or community posts (e.g. Reddit, forums, personal blogs). "
         "If only community sources are available, mention that official sources were not found. "
+        f"{SAFETY_PROMPT} "
         "Cite sources by number [1], [2], etc.\n\n"
         f"Question: {query}\n\n"
-        f"Sources:\n{sources_text}\n\n"
-        "Answer in 3–5 sentences based on the most authoritative sources available."
     )
 
+    if log_context:
+        prompt += (
+            f"User's recent log context (last 30 days):\n{log_context}\n"
+            "Where relevant, reference this data in your answer using phrases like "
+            "'in your child's case' or 'your logs show'.\n\n"
+        )
 
-async def summarize(query: str, results: list[dict]) -> str | None:
+    prompt += f"Sources:\n{sources_text}\n\nAnswer in 3–5 sentences based on the most authoritative sources available."
+    return prompt
+
+
+async def summarize(query: str, results: list[dict], log_context: str | None = None) -> str | None:
     """
     Call `claude -p` with the query and top results.
     Returns the summary string, or None on any failure.
@@ -53,7 +68,7 @@ async def summarize(query: str, results: list[dict]) -> str | None:
     if not results:
         return None
 
-    prompt = _build_prompt(query, results)
+    prompt = _build_prompt(query, results, log_context)
 
     try:
         env = os.environ.copy()

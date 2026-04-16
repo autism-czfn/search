@@ -6,6 +6,7 @@ Emits one SSE event per pipeline stage so the browser can update its UI
 progressively, without waiting 30-60 s for a single JSON response.
 
 Event sequence:
+  metadata       × 1     (safety_flag — emitted first, before any LLM content)
   stage          × 4-5   (embedding → semantic → keyword → merge → agent)
   results        × 1     (source cards — sent BEFORE the LLM runs)
   agent_activity × 0-N   (one per tool call the agent makes)
@@ -29,6 +30,8 @@ from ..search.semantic import semantic_search
 from ..search.hybrid import merge_and_rerank
 from ..llm.agent_stream import run_agent_stream
 from ..llm.summarize import summarize
+from ..safety import check_safety
+from ..analytics.patterns import fetch_log_context
 from .models import SearchResult
 
 log = logging.getLogger(__name__)
@@ -53,6 +56,7 @@ async def search_stream_generator(
     source: str | None,
     days: int | None,
     pool,
+    user_pool=None,
 ) -> AsyncGenerator[str, None]:
     """
     Full SSE pipeline for /api/search/stream.
@@ -68,6 +72,18 @@ async def search_stream_generator(
     fetch_limit = limit * 2   # fetch extra before reranking
 
     try:
+        # ── metadata event (first — safety_flag before any LLM content) ───────
+        safety_flag = check_safety(q)
+        yield _sse("metadata", {"safety_flag": safety_flag})
+
+        # ── fetch personalization context ─────────────────────────────────────
+        log_context: str | None = None
+        if user_pool is not None:
+            try:
+                log_context = await fetch_log_context(user_pool)
+            except Exception as e:
+                log.warning("stream: failed to fetch log context: %s", e)
+
         # ── stage: embedding ──────────────────────────────────────────────────
         yield _sse("stage", {
             "stage":      "embedding",
@@ -152,6 +168,7 @@ async def search_stream_generator(
             initial_results=merged[:5],
             pool=pool,
             fetch_limit=fetch_limit,
+            log_context=log_context,
         ):
             if event_type == "agent_activity":
                 yield _sse("agent_activity", payload)
@@ -180,7 +197,7 @@ async def search_stream_generator(
         # emit a second summary event if streaming already delivered one.
         if summary is None:
             log.info("stream FALLBACK to summarize()")
-            summary          = await summarize(q, merged[:5])
+            summary          = await summarize(q, merged[:5], log_context)
             agent_iterations = None
             llm_ms           = int((time.monotonic() - t_llm) * 1000)
 
