@@ -1,0 +1,17 @@
+{
+  "_comment": "Ranking formula weights. Each group must sum to 1.0 (tolerance 0.001).",
+  "search_result_weights": {
+    "source_authority": 0.40,
+    "trigger_match": 0.30,
+    "context_match": 0.15,
+    "language_match": 0.10,
+    "recency": 0.05
+  },
+  "evidence_weights": {
+    "source_authority": 0.35,
+    "extraction_confidence": 0.25,
+    "trigger_relevance": 0.20,
+    "actionability": 0.10,
+    "specificity": 0.10
+  }
+}

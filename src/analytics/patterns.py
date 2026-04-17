@@ -168,13 +168,30 @@ async def fetch_insights(pool, days: int, refresh: bool = False) -> dict:
             days,
         )
 
-        # ── top triggers ──────────────────────────────────────────────────────
+        # ── top triggers (with raw_signals aggregation) ────────────────────
         trigger_rows = await conn.fetch(
             """
-            SELECT unnest(triggers) AS trigger, COUNT(*) AS cnt
-            FROM mzhu_test_logs
-            WHERE logged_at >= now() - $1 * interval '1 day' AND NOT voided
-            GROUP BY trigger
+            WITH trigger_expanded AS (
+                SELECT id, unnest(triggers) AS trigger
+                FROM mzhu_test_logs
+                WHERE logged_at >= now() - $1 * interval '1 day' AND NOT voided
+            ),
+            signal_expanded AS (
+                SELECT id, unnest(triggers) AS trigger, unnest(raw_signals) AS raw_signal
+                FROM mzhu_test_logs
+                WHERE logged_at >= now() - $1 * interval '1 day' AND NOT voided
+                  AND array_length(raw_signals, 1) > 0
+            )
+            SELECT t.trigger,
+                   COUNT(DISTINCT t.id) AS cnt,
+                   (SELECT array_agg(DISTINCT s.raw_signal)
+                    FROM signal_expanded s
+                    WHERE s.id IN (SELECT te.id FROM trigger_expanded te WHERE te.trigger = t.trigger)
+                      AND s.raw_signal IS NOT NULL
+                      AND s.raw_signal != t.trigger
+                   ) AS raw_signals
+            FROM trigger_expanded t
+            GROUP BY t.trigger
             ORDER BY cnt DESC
             LIMIT 20
             """,
@@ -282,14 +299,21 @@ async def fetch_insights(pool, days: int, refresh: bool = False) -> dict:
     total_triggers = sum(r["cnt"] for r in trigger_rows) or 1
     total_outcomes = sum(r["cnt"] for r in outcome_rows) or 1
 
+    # Safety triggers are boosted to top regardless of frequency —
+    # one "self_harm" or "suicide" matters more than 50 "noise" events.
+    _SAFETY_TRIGGERS = {"self_harm", "aggression", "elopement", "suicide"}
+
     top_triggers = [
         {
             "trigger": r["trigger"],
             "count":   r["cnt"],
             "pct":     round(r["cnt"] / total_triggers, 2),
+            "is_safety": r["trigger"] in _SAFETY_TRIGGERS,
+            "raw_signals": r["raw_signals"] or [],
         }
         for r in trigger_rows
     ]
+    top_triggers.sort(key=lambda t: (not t["is_safety"], -t["count"]))
 
     top_outcomes = [
         {
@@ -315,6 +339,8 @@ async def fetch_insights(pool, days: int, refresh: bool = False) -> dict:
         }
         for r in pattern_rows
     ]
+    # Boost safety-related patterns to top
+    patterns.sort(key=lambda p: (p["trigger"] not in _SAFETY_TRIGGERS, -p["co_occurrence_count"]))
 
     # Daily check-in trends (SQL aggregates over mzhu_test_daily_checks)
     from_date = date.today() - timedelta(days=days)

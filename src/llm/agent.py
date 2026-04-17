@@ -132,7 +132,7 @@ async def run_agent(
             # --tools Read,Bash: restricts the available toolset to ONLY Read and
             #   Bash. Unlike --allowedTools (which only pre-approves), --tools
             #   removes Edit/Write/etc. entirely so Claude cannot touch server files.
-            "claude", "--bare", "--disable-slash-commands",
+            "claude", "--disable-slash-commands",
             "--dangerously-skip-permissions",
             "--tools", "Read,Bash",
             "-p", prompt,

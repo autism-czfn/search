@@ -25,19 +25,14 @@ get_local_ip() {
     || echo "127.0.0.1"
 }
 
+PROC_PATTERN="uvicorn $APP"
+
 is_running() {
-    if [ -f "$PIDFILE" ]; then
-        local pid
-        pid=$(cat "$PIDFILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            return 0   # running, PID valid
-        fi
+    # Match by process command line — works regardless of port or pidfile
+    if pgrep -f "$PROC_PATTERN" >/dev/null 2>&1; then
+        return 0
     fi
-    # Fallback: check if something is actually bound to the port
-    if lsof -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
-        return 0   # port is live even without a valid pidfile
-    fi
-    return 1   # not running
+    return 1
 }
 
 # ── Actions ────────────────────────────────────────────────────────────────────
@@ -45,14 +40,14 @@ is_running() {
 start_service() {
     echo ""
     if is_running; then
-        local pid
-        pid=$(cat "$PIDFILE")
-        echo "  ↻  Service already running (PID $pid) — restarting..."
-        kill "$pid" 2>/dev/null
-        # Wait up to 5 s for the port to be released
+        local old_pids
+        old_pids=$(pgrep -f "$PROC_PATTERN")
+        echo "  ↻  Stopping existing process(es): $old_pids"
+        pkill -f "$PROC_PATTERN" 2>/dev/null
+        # Wait up to 5 s for process to exit
         for i in {1..10}; do
             sleep 0.5
-            lsof -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q . || break
+            pgrep -f "$PROC_PATTERN" >/dev/null 2>&1 || break
         done
     fi
 
@@ -86,10 +81,10 @@ start_service() {
 service_status() {
     echo ""
     if is_running; then
-        local pid ip
-        pid=$(cat "$PIDFILE")
+        local pids ip
+        pids=$(pgrep -f "$PROC_PATTERN" | tr '\n' ' ')
         ip=$(get_local_ip)
-        echo "  ✅  Service is running (PID $pid)"
+        echo "  ✅  Service is running (PID $pids)"
         echo "  🌐  https://$ip:$PORT/api"
 
         # Quick health check
@@ -109,11 +104,11 @@ service_status() {
 stop_service() {
     echo ""
     if is_running; then
-        local pid
-        pid=$(cat "$PIDFILE")
-        kill "$pid" 2>/dev/null
+        local pids
+        pids=$(pgrep -f "$PROC_PATTERN" | tr '\n' ' ')
+        pkill -f "$PROC_PATTERN" 2>/dev/null
         rm -f "$PIDFILE"
-        echo "  🛑  Service stopped (PID $pid)"
+        echo "  🛑  Service stopped (PID $pids)"
     else
         echo "  ⚠️   Service is not running"
     fi
