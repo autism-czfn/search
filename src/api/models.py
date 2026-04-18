@@ -10,11 +10,16 @@ from pydantic import BaseModel, Field
 
 
 class SearchResult(BaseModel):
-    # --- identity ---
+    model_config = {"extra": "ignore"}  # tolerate extra fields from DB rows / cache
+
+    # --- identity (id also serves as chunk_id for traceability) ---
     id: int
     external_id: str | None = None
     source: str
     surface_key: str
+    source_id: str | None = Field(
+        None, description="Registry source_id mapped from surface_key (P3 traceability)"
+    )
 
     # --- content ---
     title: str
@@ -36,6 +41,20 @@ class SearchResult(BaseModel):
     # --- metadata ---
     lang: str | None = None
     engagement: dict[str, Any] | None = None  # {comments, upvotes, shares, ...}
+
+    # --- source registry metadata (added by search service via hybrid.py) ---
+    organization_name: str | None = Field(
+        None, description="Human-readable source org name from registry"
+    )
+    authority_tier: int | None = Field(
+        None, description="1 (official), 2 (academic), 3 (nonprofit), null (unknown)"
+    )
+    audience_type: str | None = Field(
+        None, description='"parent_facing" | "clinician_facing" | "mixed" | null'
+    )
+    is_live_result: bool = Field(
+        False, description="True if this result came from live search (P7), not local DB"
+    )
 
     # --- scores (added by search service, not in DB) ---
     semantic_score: float = Field(
@@ -77,8 +96,24 @@ class SearchResponse(BaseModel):
         ),
     )
     safety_flag: bool = Field(
-        False, description="True if a safety keyword was detected in the query."
+        False, description="True if a safety concern was detected in the query."
     )
+    live_fallback_triggered: bool = Field(
+        False, description="True if fallback retrieval was triggered due to insufficient local results."
+    )
+    intent_type: str | None = Field(
+        None,
+        description="Classified intent: BEHAVIORAL | MEDICAL | SAFETY | GENERAL",
+    )
+    safety_level: str | None = Field(
+        None,
+        description="Safety level: LOW | MEDIUM | HIGH",
+    )
+
+
+class CacheStats(BaseModel):
+    cache_size: int = 0
+    oldest_entry: datetime | None = None
 
 
 class StatsResponse(BaseModel):
@@ -87,6 +122,7 @@ class StatsResponse(BaseModel):
     items_by_source: dict[str, int]
     last_collected_at: datetime | None = None
     last_embedded_at: datetime | None = None
+    evidence_cache: CacheStats | None = None
 
 
 class HealthResponse(BaseModel):
@@ -100,6 +136,8 @@ class TriggerCount(BaseModel):
     trigger: str
     count: int
     pct: float
+    is_safety: bool = False
+    raw_signals: list[str] = Field(default_factory=list)
 
 
 class OutcomeCount(BaseModel):
@@ -208,3 +246,106 @@ class ClinicianReportResponse(BaseModel):
     key_concerns_text: str | None
     generated_at: str
     cached: bool = False
+
+
+# ── Source registry response models (P1) ─────────────────────────────────────
+
+class SourceListItem(BaseModel):
+    source_id: str
+    organization_name: str
+    authority_tier: int | None = None
+    source_type: str
+    audience_type: str
+    publication_type: str | None = None
+    language: str
+    country: str | None = None
+    domain: str
+    is_active: bool
+
+
+class SourceListResponse(BaseModel):
+    sources: list[SourceListItem]
+    total: int
+
+
+# ── Evidence traceability response (P3) ──────────────────────────────────────
+
+class EvidenceResponse(BaseModel):
+    chunk_id: int
+    source_id: str | None = None
+    source_domain: str | None = None
+    organization_name: str | None = None
+    authority_tier: int | None = None
+    audience_type: str | None = None
+    page_title: str
+    page_url: str
+    full_text: str | None = None
+    snippet: str
+    published_at: datetime | None = None
+    collected_at: datetime
+
+
+# ── Curated evidence models (P8) ─────────────────────────────────────────────
+
+class EvidenceCard(BaseModel):
+    source_title: str
+    organization_name: str
+    publication_type: str | None = None
+    link: str | None = None
+    summary: str
+    confidence_tag: str | None = None  # "high" | "medium" | None
+    is_live_result: bool = False
+
+
+class PatternEvidenceResponse(BaseModel):
+    trigger: str
+    outcome: str | None = None
+    evidence: list[EvidenceCard]
+    generated_at: str
+
+
+class InsightRecommendation(BaseModel):
+    text: str
+
+
+class PatternWithEvidence(BaseModel):
+    trigger: str
+    outcome: str
+    co_occurrence_count: int
+    co_occurrence_pct: float
+    total_trigger_events: int
+    confidence_level: str
+    sample_count: int
+    raw_signals: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceCard]
+    recommendations: list[InsightRecommendation]
+
+
+class InsightWithEvidenceResponse(BaseModel):
+    top_triggers: list[TriggerCount]
+    top_outcomes: list[OutcomeCount]
+    patterns: list[PatternWithEvidence]
+    intervention_effectiveness: list[InterventionEffectiveness]
+    log_count: int
+    date_range: dict[str, Any]
+    daily_check_trends: DailyCheckTrends
+    generated_at: str = ""
+    cached: bool = False
+
+
+# ── Webhook models (Collect P3.1) ──────────────────────────────────────────
+
+class TriggerEventPayload(BaseModel):
+    event_type: str = Field(description='"safety_alert" | "high_severity" | "new_trigger"')
+    child_id: str = "default"
+    trigger: str
+    severity: int | None = None
+    tags: list[str] = []
+    logged_at: str | None = None
+
+
+class TriggerEventResponse(BaseModel):
+    status: str
+    event_type: str
+    search_triggered: bool
+    results_cached: int = 0

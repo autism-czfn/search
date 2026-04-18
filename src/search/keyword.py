@@ -18,8 +18,11 @@ _SELECT = """
     published_at, collected_at, lang, engagement
 """
 
-_FTS_VECTOR = """
-    to_tsvector('english',
+
+def _fts_vector(fts_config: str) -> str:
+    """Build the tsvector expression for a given FTS config."""
+    return f"""
+    to_tsvector('{fts_config}',
         coalesce(title, '') || ' ' ||
         coalesce(description, '') || ' ' ||
         coalesce(content_body, '')
@@ -33,11 +36,23 @@ async def keyword_search(
     fetch_limit: int = 20,
     source: str | None = None,
     days: int | None = None,
+    fts_config: str = "english",
 ) -> list[dict]:
     """
     Full-text search. Returns a list of dicts with a 'keyword_score' key.
     Returns [] if no rows match or on any error.
+
+    Args:
+        fts_config: PostgreSQL FTS configuration name.
+            'english' (default) — standard English stemming/stopwords.
+            'simple' — language-agnostic (splits on whitespace, lowercases).
+                       Use for non-English queries (P7 multilingual search).
     """
+    # Validate fts_config to prevent SQL injection (only allow known configs)
+    if fts_config not in ("english", "simple", "french", "german", "spanish"):
+        fts_config = "english"
+
+    fts_vec = _fts_vector(fts_config)
     params: list = [query]
     extra_filters: list[str] = []
     p = 2  # next param index
@@ -57,9 +72,9 @@ async def keyword_search(
     sql = f"""
         SELECT
             {_SELECT},
-            ts_rank({_FTS_VECTOR}, plainto_tsquery('english', $1)) AS keyword_score
+            ts_rank({fts_vec}, plainto_tsquery('{fts_config}', $1)) AS keyword_score
         FROM crawled_items
-        WHERE {_FTS_VECTOR} @@ plainto_tsquery('english', $1)
+        WHERE {fts_vec} @@ plainto_tsquery('{fts_config}', $1)
         {filters_sql}
         ORDER BY keyword_score DESC
         LIMIT {fetch_limit}
