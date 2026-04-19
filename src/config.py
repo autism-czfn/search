@@ -25,8 +25,15 @@ class Settings(BaseSettings):
     live_search_enabled: bool = True
     live_search_min_local_results: int = 3
     live_search_min_local_score: float = 0.4
-    live_search_max_sources: int = 3
+    live_search_max_sources: int = 23
     live_search_timeout_sec: float = 5.0
+
+    # Agent subprocess timeout (P-SRC-8)
+    agent_timeout_seconds: int = 60
+
+    # Redis for safety state persistence (P-SRC-6b / SAFETY_EXPANDED_MODE)
+    # If unavailable: safety flag is disabled, HYBRID mode is used instead.
+    redis_url: str | None = "redis://localhost:6379/0"
 
 
 settings = Settings()

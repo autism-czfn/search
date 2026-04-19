@@ -11,14 +11,18 @@
 - **5 因子排序**：source_authority (0.40) + trigger_match (0.30) + context_match (0.15) + language_match (0.10) + recency (0.05)，权重可通过 `config/ranking.json` 调整
 - **源注册表**：`config/sources.json` 定义 28 个可信来源（Tier 1/2/3），替代硬编码 boost 列表，驱动权限过滤与排序
 - **实时站内搜索**：对 28 个官方站点直接搜索（JSON API / HTML 抓取 / Sitemap），不依赖 Google/Bing
-- **搜索路由引擎**：根据意图分类和本地结果质量，智能选择 LOCAL_ONLY / HYBRID / LIVE_ONLY 模式；安全场景强制触发实时搜索
+- **搜索路由引擎**：根据意图分类和本地结果质量，智能选择 LOCAL_ONLY / HYBRID / LIVE_ONLY / SAFETY_EXPANDED_MODE 模式；安全场景强制触发实时搜索
+- **SAFETY_EXPANDED_MODE (P-SRC-6)**：高危意图（self_harm / suicide / violence / abuse）或 Redis 安全标志激活时触发；两阶段并行扇出覆盖全部 Tier-1 / Tier-2 来源，绕过缓存，强制多样性约束；自伤意图额外返回 cross_source_consensus、key_clinical_guidance、urgent_help_section（后者硬编码兜底，永不缺失）
+- **Redis 安全状态 (P-SRC-6b)**：`src/safety_state.py` 以 `safety:{child_id}` 为 Key、TTL 1800s（30 分钟）在 Redis 存储安全标志；Redis 不可用时优雅降级（不崩溃）
+- **危机语言检测**：识别「自杀 / 自伤 / 不想活」等显式危机短语（含中文），强制要求结果中 ≥ 3 个 Tier-1 来源
+- **安全 Webhook (P-SRC-6b)**：`POST /api/safety-webhook` 接收 collect 服务推送；设置 Redis 安全标志并预热缓存，确保后续搜索即时返回
 - **本地上下文准入**：4 项质量门控（相关性 ≥0.75、质量 ≥0.6、时效 ≥0.5、覆盖 ≥2 条），确保本地结果质量
 - **证据缓存**：按 normalized_query_hash + language + time_bucket 缓存搜索证据，支持 trigger_key 维度失效
 - **多语言搜索**：查询翻译 → 本地 DB 目标语言检索 → 结果摘要回译英文，支持 fr/de/ja/es
 - **触发策略**：智能判断是否需要搜索（新触发因素、安全敏感、缓存过期等），避免重复查询
 - **策展证据**：面向 Insights 标签页的干净证据卡片（仅可信来源，无原始分数泄露）
 - **Claude 智能体回答**：调用 `claude -p`，开放 `Read + Bash` 工具；智能体可读入预取结果的临时 JSON 文件，必要时自主调用 CLI 搜索工具继续迭代
-- **流式响应**：`/api/search/stream` 基于 SSE 分阶段推送 `metadata → stage → results → agent_activity → summary → done`
+- **流式响应**：`/api/search/stream` 基于 SSE 分阶段推送；普通模式 `metadata → stage → results → agent_activity → summary → done`；SAFETY_EXPANDED_MODE 额外推送 `safety_extras` 事件
 - **个性化上下文**：从用户 DB 中读取近 30 天日志与每日检查，拼成精简上下文注入 LLM 提示
 - **安全检测**：两层策略——意图分类器（同义词/规则语义匹配）+ 提示词注入让 Claude 以 `⚠ SAFETY:` 前缀响应
 - **分析接口**：`/api/insights`、`/api/weekly-summary`、`/api/clinician-report` 三个围绕 `mzhu_test_logs / _interventions / _daily_checks / _summaries` 的端点，全部走 SQL 聚合 + LLM 叙述，结果带缓存
@@ -34,9 +38,27 @@ User Query
    ↓
 [1] Intent Classification (BEHAVIORAL / MEDICAL / SAFETY / GENERAL)
    ↓
-[2] Trigger Policy (should_search? — cache check, safety override)
+[2] Redis Safety Flag Check (get_safety_flag child_id)   ← P-SRC-6b
    ↓
-[3] Routing Engine (LOCAL_ONLY / HYBRID / LIVE_ONLY)
+[3] Early Route Decision
+   │
+   ├─ SAFETY_EXPANDED_MODE (intent ∈ {self_harm, suicide, violence, abuse}
+   │                         OR Redis safety flag is set):
+   │   ├─ Cache BYPASSED entirely
+   │   ├─ Phase 1: parallel fan-out → all 7 Tier-1 sources (≤ 6s budget)
+   │   │   CDC, NIMH, NICE, NHS, AAP, Mayo Clinic, PubMed
+   │   ├─ Phase 2 (if insufficient coverage): add 4 Tier-2 sources
+   │   │   Europe PMC, Semantic Scholar, OpenAlex, ClinicalTrials.gov
+   │   ├─ Diversity enforcement: ≥ 4 domains, ≥ 2 Tier-1, no source > 40%
+   │   │   Crisis language → force ≥ 3 Tier-1 sources
+   │   ├─ Ranking: raw = 0.45×authority + 0.35×combined → sigmoid(raw)
+   │   └─ Extras (self_harm/crisis): cross_source_consensus,
+   │       key_clinical_guidance, urgent_help_section (hardcoded fallback)
+   │
+   └─ NORMAL path continues:
+[4] Trigger Policy (should_search? — cache check, safety override)
+   ↓
+[5] Routing Engine (LOCAL_ONLY / HYBRID / LIVE_ONLY)
    │
    ├─ LOCAL path:
    │   ├─► fastembed (nomic-ai/nomic-embed-text-v1.5, 768d)
@@ -50,15 +72,15 @@ User Query
    └─ MULTILINGUAL path:
        └─► translate query → local DB search → translate snippets
    ↓
-[4] merge_and_rerank (5-factor ranking formula)
+[6] merge_and_rerank (5-factor ranking formula)
         source_authority × 0.40 + trigger_match × 0.30
       + context_match × 0.15 + language_match × 0.10 + recency × 0.05
    ↓
-[5] Evidence Cache (store/retrieve by query_hash + lang + date)
+[7] Evidence Cache (store/retrieve by query_hash + lang + date)
    ↓
-[6] safety check + fetch_log_context (用户 DB, ≥5 条日志才注入)
+[8] safety check + fetch_log_context (用户 DB, ≥5 条日志才注入)
    ↓
-[7] run_agent (claude -p, Read+Bash, 60s 超时)
+[9] run_agent (claude -p, Read+Bash, 60s 超时)
    │   └─ 读 /tmp/autism_agent_<uuid>.json
    │   └─ 按需调用 python -m src.tools.search | src.tools.pubmed
    │
@@ -67,7 +89,7 @@ User Query
 
 若语义向量不可用（`embed_query` 返回 None），自动降级为 `keyword_only` 模式。
 
-流式端点 `/api/search/stream` 使用 `run_agent_stream`，会额外把 Claude 的每次工具调用转为 `agent_activity` 事件推送给前端。
+流式端点 `/api/search/stream` 使用 `run_agent_stream`，会额外把 Claude 的每次工具调用转为 `agent_activity` 事件推送给前端。SAFETY_EXPANDED_MODE 下改为推送 `safety_extras` 事件，不走 LLM 智能体管道。
 
 ---
 
@@ -100,11 +122,13 @@ NCBI_API_KEY=               # 可选：PubMed E-utilities 配额
 RANKING_CONFIG_PATH=        # 可选：自定义排序权重 JSON 路径（默认 config/ranking.json）
 TRANSLATION_API=            # 可选："google" | "deepl"，多语言查询翻译
 TRANSLATION_API_KEY=        # 可选：翻译 API 密钥（无则降级为英文查询搜非英文内容）
+REDIS_URL=redis://localhost:6379/0  # 可选：安全状态持久化；缺失时 SAFETY_EXPANDED_MODE 仍可运行，但跨请求安全标志不持久
 ```
 
 - `DATABASE_URL` — 爬虫库，读取 `crawled_items`、`embedding` 等
 - `USER_DATABASE_URL` — 用户库，读取 `mzhu_test_logs / _interventions / _daily_checks / _insights_cache / _summaries`；留空则个性化与分析端点全部降级为 503
 - `COLLECT_BASE_URL` — collect 服务地址，周报生成后 POST 回写
+- `REDIS_URL` — Redis 连接串，用于 `safety:{child_id}` 安全标志（TTL 30 分钟）；不可用时优雅降级，不影响其他功能
 
 ### 3. 数据库迁移
 
@@ -149,12 +173,19 @@ Swagger 文档：`https://<host>:3002/docs`
 | `lang` | string |  | 搜索语言（默认 `en`；`all` 搜全部语言）|
 | `audience` | string |  | 受众过滤：`parent` / `clinician` |
 | `refresh` | bool |  | 跳过缓存强制重新搜索 |
+| `child_id` | string |  | 子女标识符（默认 `default`），用于 Redis 安全标志查找 |
 
-返回体包含 `results`、`search_mode`（`hybrid` / `keyword_only`）、`search_time_ms`、`summary`、`llm_time_ms`、`agent_iterations`、`safety_flag`。
+返回体包含 `results`、`search_mode`（`hybrid` / `keyword_only` / `safety_expanded`）、`search_time_ms`、`summary`、`llm_time_ms`、`agent_iterations`、`safety_flag`、`intent_type`、`safety_level`。
+
+当 `search_mode = "safety_expanded"` 时，返回体为 `SafetySearchResponse`，额外包含：
+- `safety_incomplete` — Phase 1+2 后仍未满足多样性约束时为 `true`
+- `extras` — 自伤/危机意图时包含 `cross_source_consensus`、`key_clinical_guidance`、`urgent_help_section`
 
 ### `GET /api/search/stream`
 
-相同参数，返回 `text/event-stream`。事件序列：
+相同参数，返回 `text/event-stream`。
+
+**普通模式**事件序列：
 
 ```
 metadata       × 1    (safety_flag)
@@ -164,6 +195,40 @@ agent_activity × 0-N  (智能体每次工具调用)
 summary        × 0-1  (最终答案；两层回退后仍可能缺失)
 done           × 1    (总耗时 / agent_iterations / llm_time_ms)
 ```
+
+**SAFETY_EXPANDED_MODE** 事件序列（P-SRC-6）：
+
+```
+metadata       × 1    (safety_flag: true)
+stage          × 1-2  (safety_fan_out → safety_merge)
+results        × 1    (来源卡片)
+safety_extras  × 0-1  (cross_source_consensus, key_clinical_guidance, urgent_help_section)
+done           × 1    (总耗时)
+```
+
+### `POST /api/safety-webhook`
+
+接收 collect 服务的安全事件推送（P-SRC-6b）。
+
+**请求体（JSON）**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `event_id` | string | ✅ | 唯一事件 ID（来自 collect 的 UUID）|
+| `child_id` | string | ✅ | 子女标识符 |
+| `trigger_type` | string | ✅ | `"self_harm"` / `"violence"` / `"abuse"` / `"elopement"` / `"aggression"` / `"emergency"` |
+| `severity` | int |  | 严重程度 1–5 |
+| `raw_text` | string |  | 家长原始描述（保留）|
+| `normalized_intent` | string |  | collect 分类的意图标签 |
+| `timestamp` | string |  | ISO 8601 时间戳 |
+| `source` | string |  | 始终为 `"collect"` |
+
+**行为**：
+1. 在 Redis 设置 `safety:{child_id}` 标志（TTL 1800s）
+2. 以 `{trigger_type} autism` 为查询词运行搜索管道（不含 LLM 摘要）
+3. 将前 10 条结果写入证据缓存，供下次搜索即时返回
+
+**响应**：`SafetyWebhookResponse`（`status`, `event_id`, `child_id`, `trigger_type`, `safety_flag_set`, `results_cached`）
 
 ### `GET /api/sources`
 
@@ -221,6 +286,10 @@ done           × 1    (总耗时 / agent_iterations / llm_time_ms)
 - `daily_check_summary` — 含周趋势
 - `key_concerns_text` — LLM 生成的「关注点」段落，以 SQL 统计 + 最高频 trigger 的 top 3 证据结果为依据
 
+### `POST /api/webhooks/trigger-event`（已废弃）
+
+遗留端点，保留向后兼容。新代码请使用 `POST /api/safety-webhook`。
+
 ---
 
 ## 项目结构
@@ -234,14 +303,16 @@ search/
 │   └── 001_evidence_cache.sql     # evidence_cache 表 + insights_cache 扩展
 ├── src/
 │   ├── main.py                    # FastAPI app + lifespan + PNA 中间件
-│   ├── config.py                  # pydantic-settings (.env)
+│   ├── config.py                  # pydantic-settings (.env)，含 REDIS_URL
 │   ├── db.py / user_db.py         # asyncpg 连接池（双库）
 │   ├── embedder.py                # fastembed 单例
 │   ├── safety.py                  # 两层安全检测（意图分类器 + LLM）
+│   ├── safety_state.py            # Redis 安全标志 set/get（P-SRC-6b，TTL 1800s）
 │   ├── api/
-│   │   ├── routes.py              # 所有 API 端点
-│   │   ├── stream.py              # SSE 生成器
-│   │   └── models.py              # Pydantic 请求/响应模型
+│   │   ├── routes.py              # 所有 API 端点（含 /api/safety-webhook）
+│   │   ├── stream.py              # SSE 生成器（含 SAFETY_EXPANDED_MODE 事件序列）
+│   │   └── models.py              # Pydantic 模型（含 SafetyWebhookPayload/Response,
+│   │                              #   SafetyExtras, SafetySearchResponse）
 │   ├── search/
 │   │   ├── semantic.py            # pgvector 余弦相似度
 │   │   ├── keyword.py             # tsvector 全文检索（支持多语言 FTS config）
@@ -251,7 +322,9 @@ search/
 │   │   ├── intent_classifier.py   # 意图分类（BEHAVIORAL/MEDICAL/SAFETY/GENERAL）
 │   │   ├── trigger_policy.py      # 搜索触发策略
 │   │   ├── local_qualifier.py     # 本地上下文 4 因子准入门控
-│   │   ├── live_fallback.py       # 搜索路由引擎（LOCAL/HYBRID/LIVE 决策）
+│   │   ├── live_fallback.py       # 搜索路由引擎（LOCAL/HYBRID/LIVE/SAFETY_EXPANDED）
+│   │   ├── safety_expanded.py     # SAFETY_EXPANDED_MODE 实现（P-SRC-6）
+│   │   │                          #   两阶段 Tier-1/2 扇出、多样性约束、危机语言检测
 │   │   ├── site_search.py         # 28 站实时站内搜索引擎
 │   │   ├── multilingual.py        # 多语言搜索（翻译 → 检索 → 回译）
 │   │   └── pubmed.py              # PubMed E-utilities 客户端
@@ -286,22 +359,26 @@ search/
 
 | 等级 | 来源 | 数量 |
 |------|------|------|
-| Tier 1 | PubMed, NICE, NHS, CDC, NIMH, AAP, CDC Data | 7 |
-| Tier 2 | Mayo Clinic, Europe PMC, Semantic Scholar, OpenAlex, Crossref, bioRxiv, DOAJ, ClinicalTrials.gov, CORE | 9 |
+| Tier 1 | PubMed, NICE, NHS, CDC, NIMH, AAP, Mayo Clinic | 7 |
+| Tier 2 | Europe PMC, Semantic Scholar, OpenAlex, Crossref, bioRxiv, DOAJ, ClinicalTrials.gov, CORE | 8 |
 | Tier 3 | Autism Society, ASF, SPARK, Autism Navigator, Autism Spectrum News, Spectrum News, ASAN, Wikipedia | 8 |
 | 非英文 | France HAS (fr), Germany Neuro (de), Japan DDIS (ja), Spain Autismo (es) | 4 |
+| 其他 | OpenAlex（补充）等 | 1 |
 
 爬取与入库由姊妹项目 `collect` 负责；本服务只读 `crawled_items` 与 `embedding`。实时搜索通过站内 API/HTML 直接查询各站点。
+
+SAFETY_EXPANDED_MODE 下，Tier-1 来源（CDC, NIMH, NICE, NHS, AAP, Mayo Clinic, PubMed）优先覆盖，若 Phase 1 结果不满足多样性约束，则追加 Tier-2 来源（Europe PMC, Semantic Scholar, OpenAlex, ClinicalTrials.gov）。
 
 ---
 
 ## 核心设计原则
 
 1. **意图优先于关键词** — 语义意图分类替代脆弱的精确关键词匹配
-2. **安全优先于一切** — 安全场景强制触发实时搜索，永不仅依赖本地数据
+2. **安全优先于一切** — 高危意图或 Redis 安全标志强制激活 SAFETY_EXPANDED_MODE，绕过缓存，永不仅依赖本地数据
 3. **实时确保正确性** — 直接搜索官方来源，不依赖第三方搜索引擎
 4. **本地实现个性化** — 用户日志上下文注入 LLM 提示
-5. **优雅降级，不静默失败** — 实时失败回退本地 + 警告；本地失败仍返回实时；均失败返回安全兜底消息
+5. **优雅降级，不静默失败** — 实时失败回退本地 + 警告；本地失败仍返回实时；均失败返回安全兜底消息；Redis 不可用不影响核心功能
+6. **危机响应永不缺失** — `urgent_help_section` 硬编码兜底，LLM 失败时自动使用（911 / 988 / 741741）
 
 ---
 
@@ -314,4 +391,5 @@ search/
 | `fastembed` | 本地文本向量化（nomic-embed-text-v1.5，无需 API Key）|
 | `pydantic` / `pydantic-settings` | 数据校验与 `.env` 读取 |
 | `httpx` | PubMed / collect / 站内搜索的异步 HTTP 客户端 |
+| `redis[asyncio]` | 可选：安全状态持久化（`redis.asyncio`）；未安装时优雅降级 |
 | `claude` CLI | 外部依赖——智能体 / 摘要 / 周报 / 临床报告都 shell out 到它，不在 PATH 时自动降级 |

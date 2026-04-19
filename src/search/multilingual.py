@@ -22,6 +22,7 @@ import os
 
 import httpx
 
+from ..config import settings
 from ..sources.registry import get_registry
 from ..embedder import embed_query
 from .keyword import keyword_search
@@ -63,12 +64,17 @@ async def translate_query(query_en: str, target_lang: str) -> str:
     if cache_key in _translation_cache:
         return _translation_cache[cache_key]
 
-    api_key = os.environ.get("TRANSLATION_API_KEY")
+    # Use settings (respects defaults and env-var overrides) rather than
+    # reading the raw env var directly, which would miss the default "google".
+    api_provider = settings.translation_api or ""
+    if not api_provider:
+        log.debug("TRANSLATION_API not configured — skipping translation")
+        return query_en
+
+    api_key = settings.translation_api_key or os.environ.get("TRANSLATION_API_KEY")
     if not api_key:
         log.debug("No TRANSLATION_API_KEY — returning English query as-is")
         return query_en
-
-    api_provider = os.environ.get("TRANSLATION_API", "google")
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:

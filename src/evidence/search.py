@@ -51,7 +51,7 @@ def _to_evidence_card(item: dict) -> EvidenceCard:
 
     return EvidenceCard(
         source_title=item.get("title") or "(untitled)",
-        organization_name=entry.organization_name if entry else source_key,
+        source_name=entry.organization_name if entry else source_key,
         publication_type=entry.publication_type if entry else None,
         link=item.get("url"),
         summary=summary,
@@ -64,7 +64,7 @@ async def fetch_curated_evidence(
     pool,
     query: str,
     limit: int = 5,
-) -> list[EvidenceCard]:
+) -> tuple[list[EvidenceCard], int]:
     """
     Fetch curated evidence cards for a query.
 
@@ -73,6 +73,11 @@ async def fetch_curated_evidence(
       2. Filter: keep only trusted sources (authority_tier 1/2/3)
       3. Take top `limit` results
       4. Convert to clean EvidenceCard objects (no raw scores)
+
+    Returns:
+        (cards, live_sites_searched) — cards is the evidence list;
+        live_sites_searched is how many websites were queried during live search
+        (0 if live search was not triggered).
     """
     fetch_n = limit * 3  # fetch more to allow filtering
 
@@ -85,16 +90,18 @@ async def fetch_curated_evidence(
     kw_results = await keyword_search(pool, query, fetch_n, None, None)
 
     if not sem_results and not kw_results:
-        return []
+        return [], 0
 
     merged, _mode = merge_and_rerank(sem_results, kw_results, top_n=fetch_n)
 
     # ── Live search: supplement if local results are weak ────────────────
+    live_sites_searched = 0
     route = determine_route(merged, query)
     if route in ("HYBRID", "LIVE_ONLY"):
-        live_results = await run_live_search(query, merged)
+        live_results, live_sites_searched = await run_live_search(query, merged)
         if live_results:
-            log.info("evidence: live search added %d results (route=%s)", len(live_results), route)
+            log.info("evidence: live search added %d results from %d sites (route=%s)",
+                     len(live_results), live_sites_searched, route)
             merged = merged + live_results
 
     # Filter to evidence-quality sources only.
@@ -110,7 +117,7 @@ async def fetch_curated_evidence(
     local = [item for item in filtered if not item.get("is_live_result")]
     live = [item for item in filtered if item.get("is_live_result")]
     selected = local[:limit] + live[:limit]
-    return [_to_evidence_card(item) for item in selected]
+    return [_to_evidence_card(item) for item in selected], live_sites_searched
 
 
 def _extract_json_array(text: str) -> list[dict] | None:
@@ -146,13 +153,13 @@ async def generate_recommendations(
     Falls back to empty list on any failure.
     """
     evidence_text = "\n".join(
-        f"- {card.organization_name}: {card.summary}" for card in evidence
+        f"- {card.source_name}: {card.summary}" for card in evidence
     )
 
     trigger = pattern.get("trigger", "unknown")
     outcome = pattern.get("outcome", "unknown")
     sample_count = pattern.get("sample_count", 0)
-    pct = pattern.get("co_occurrence_pct", 0)
+    pct = round(pattern.get("co_occurrence_pct", 0) * 100, 1)  # ratio 0-1 → percentage for prompt
 
     prompt = (
         "Based on the following behavioral pattern and evidence, "

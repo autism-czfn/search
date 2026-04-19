@@ -82,7 +82,7 @@
       "search_url": null,
       "is_active": true,
       "update_frequency": "daily",
-      "notes": "NHS Conditions API. Not yet connected — pending API key registration.",
+      "notes": "NHS Conditions API. Not yet connected \u2014 pending API key registration.",
       "live_search": {
         "method": "site_search",
         "search_url": "https://www.nhs.uk/search/results",
@@ -130,7 +130,7 @@
       "source_id": "cdc_milestones",
       "surface_key": "cdc_milestones",
       "domain": "www.cdc.gov",
-      "organization_name": "CDC — Learn the Signs",
+      "organization_name": "CDC \u2014 Learn the Signs",
       "language": "en",
       "country": "US",
       "source_type": "official_health",
@@ -150,7 +150,7 @@
       "source_id": "cdc_seed",
       "surface_key": "cdc_seed",
       "domain": "www.cdc.gov",
-      "organization_name": "CDC — SEED Study",
+      "organization_name": "CDC \u2014 SEED Study",
       "language": "en",
       "country": "US",
       "source_type": "official_health",
@@ -185,14 +185,10 @@
       "update_frequency": "weekly",
       "notes": "Autism overview, behavior, treatment, research summaries.",
       "live_search": {
-        "method": "site_search",
-        "search_url": "https://www.nimh.nih.gov/search",
-        "params_template": {
-          "q": "{q} autism"
-        },
-        "response_format": "html",
-        "result_pattern": "<a[^>]+href=\"(https://www\\.nimh\\.nih\\.gov/[^\"]+)\"[^>]*>([^<]+)</a>",
-        "snippet_pattern": null,
+        "method": "sitemap_index",
+        "search_url": "https://www.nimh.nih.gov/health/topics",
+        "url_prefix": "/health/",
+        "min_match_terms": 1,
         "max_results": 5
       }
     },
@@ -463,16 +459,15 @@
       "notes": null,
       "live_search": {
         "method": "api",
-        "search_url": "https://doaj.org/api/search/articles/",
+        "search_url": "https://doaj.org/api/search/articles/{q}",
         "params_template": {
-          "search": "{q} autism",
           "page": "1",
           "pageSize": "5"
         },
         "response_format": "json",
         "result_path": "results",
         "title_field": "bibjson.title",
-        "url_field": "",
+        "url_field": "bibjson.link",
         "snippet_field": "bibjson.abstract",
         "max_results": 5
       }
@@ -794,7 +789,7 @@
       "source_id": "france_has",
       "surface_key": "france_has",
       "domain": "www.has-sante.fr",
-      "organization_name": "Haute Autorité de Santé",
+      "organization_name": "Haute Autorit\u00e9 de Sant\u00e9",
       "language": "fr",
       "country": "FR",
       "source_type": "official_health",
@@ -854,7 +849,7 @@
       "source_id": "spain_autismo",
       "surface_key": "spain_autismo",
       "domain": "www.autismo.org.es",
-      "organization_name": "Autismo España",
+      "organization_name": "Autismo Espa\u00f1a",
       "language": "es",
       "country": "ES",
       "source_type": "nonprofit",

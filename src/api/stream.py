@@ -5,12 +5,19 @@ SSE generator for GET /api/search/stream.
 Emits one SSE event per pipeline stage so the browser can update its UI
 progressively, without waiting 30-60 s for a single JSON response.
 
-Event sequence:
+Event sequence (normal mode):
   metadata       × 1     (safety_flag — emitted first, before any LLM content)
   stage          × 4-5   (embedding → semantic → keyword → merge → agent)
   results        × 1     (source cards — sent BEFORE the LLM runs)
   agent_activity × 0-N   (one per tool call the agent makes)
   summary        × 0-1   (LLM answer; absent only if DB is down)
+  done           × 1     (always the final event)
+
+Event sequence (SAFETY_EXPANDED_MODE — P-SRC-6):
+  metadata       × 1     (safety_flag: true — emitted first)
+  stage          × 1-2   (safety_fan_out → safety_merge)
+  results        × 1     (source cards — sent BEFORE the LLM runs)
+  safety_extras  × 0-1   (cross_source_consensus, key_clinical_guidance, urgent_help_section)
   done           × 1     (always the final event)
 
 The generator never raises — it always closes with a `done` event so the
@@ -32,6 +39,9 @@ from ..llm.agent_stream import run_agent_stream
 from ..llm.summarize import summarize
 from ..safety import check_safety
 from ..analytics.patterns import fetch_log_context
+from ..safety_state import get_safety_flag
+from ..search.live_fallback import determine_route, _SAFETY_EXPANDED_INTENTS
+from ..search.intent_classifier import classify_intent
 from .models import SearchResult
 
 log = logging.getLogger(__name__)
@@ -57,12 +67,17 @@ async def search_stream_generator(
     days: int | None,
     pool,
     user_pool=None,
+    child_id: str = "default",
+    lang: str = "en",
 ) -> AsyncGenerator[str, None]:
     """
     Full SSE pipeline for /api/search/stream.
     Yields SSE-formatted strings; FastAPI's StreamingResponse writes them
     to the HTTP response as each one is produced.
     Guaranteed to always yield a final `done` event, even on unexpected errors.
+
+    In SAFETY_EXPANDED_MODE: emits metadata(safety_flag:true), stage events,
+    results, safety_extras, done — bypasses normal LLM agent pipeline.
     """
     t0 = time.monotonic()
 
@@ -72,9 +87,71 @@ async def search_stream_generator(
     fetch_limit = limit * 2   # fetch extra before reranking
 
     try:
+        # ── Intent classification + Redis safety flag check ───────────────────
+        intent = classify_intent(q)
+        redis_safety_flag = await get_safety_flag(child_id)
+
+        # ── P-SRC-6: Check for SAFETY_EXPANDED_MODE before anything else ─────
+        is_safety_expanded = (
+            (intent.intent_type and intent.intent_type.lower() in _SAFETY_EXPANDED_INTENTS)
+            or redis_safety_flag is not None
+        )
+
         # ── metadata event (first — safety_flag before any LLM content) ───────
-        safety_flag = check_safety(q)
-        yield _sse("metadata", {"safety_flag": safety_flag})
+        safety_flag_val = is_safety_expanded or check_safety(q, intent=intent)
+        yield _sse("metadata", {"safety_flag": safety_flag_val})
+
+        # ── SAFETY_EXPANDED_MODE branch ───────────────────────────────────────
+        if is_safety_expanded:
+            log.info("stream SAFETY_EXPANDED_MODE query=%r intent=%s redis_flag=%s",
+                     q, intent.intent_type, bool(redis_safety_flag))
+            yield _sse("stage", {
+                "stage":      "safety_fan_out",
+                "message":    "Running safety-expanded search across all trusted authorities…",
+                "elapsed_ms": elapsed(),
+            })
+
+            from ..search.safety_expanded import run_safety_expanded_search
+            safety_result = await run_safety_expanded_search(
+                query=q, intent_type=intent.intent_type, child_id=child_id
+            )
+
+            yield _sse("stage", {
+                "stage":      "safety_merge",
+                "message":    "Merging and ranking safety results…",
+                "elapsed_ms": elapsed(),
+            })
+
+            raw_results = safety_result.get("results", [])
+            serialised: list[dict] = []
+            for item in raw_results[:limit]:
+                try:
+                    serialised.append(SearchResult(**item).model_dump(mode="json"))
+                except Exception:
+                    pass
+
+            yield _sse("results", {
+                "results":        serialised,
+                "total":          len(serialised),
+                "search_mode":    "safety_expanded",
+                "search_time_ms": elapsed(),
+                "safety_flag":    True,
+                "safety_incomplete": safety_result.get("safety_incomplete", False),
+            })
+
+            # ── safety_extras event ───────────────────────────────────────────
+            extras = safety_result.get("extras")
+            if extras is not None:
+                yield _sse("safety_extras", extras)
+
+            yield _sse("done", {
+                "agent_iterations": None,
+                "llm_time_ms":      elapsed(),
+                "total_time_ms":    elapsed(),
+            })
+            return
+
+        # ── Normal pipeline (non-safety) ─────────────────────────────────────
 
         # ── fetch personalization context ─────────────────────────────────────
         log_context: str | None = None

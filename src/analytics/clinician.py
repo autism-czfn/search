@@ -108,7 +108,7 @@ async def _compute_stats(user_pool, days: int) -> dict:
             "trigger":               trigger,
             "outcome":               outcome,
             "co_occurrence_count":   co_count,
-            "co_occurrence_pct":     round(co_pct, 3),
+            "co_occurrence_pct":     round(co_pct * 100, 1),
             "total_trigger_events":  total,
             "confidence_level":      _pattern_confidence(co_pct, total),
             "sample_count":          total,

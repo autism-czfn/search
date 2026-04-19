@@ -41,7 +41,11 @@ def _normalise(values: list[float]) -> list[float]:
 
 
 def _enrich_with_registry(item: dict) -> dict:
-    """Add registry metadata (source_id, organization_name, authority_tier, audience_type) to a result dict."""
+    """Add registry metadata (source_id, source_name, authority_tier, audience_type, chunk_id) to a result dict.
+
+    API CONTRACT (P-SRC-1): expose source_name (not organization_name) in all /api/* responses.
+    chunk_id is aliased to item["id"] for the evidence panel (P-SRC-1 / P1.2).
+    """
     registry = get_registry()
     # Check surface_key first (actual source identity), then fall back to source
     # (which may be a platform name like "html_crawl" for crawled official sites)
@@ -50,15 +54,19 @@ def _enrich_with_registry(item: dict) -> dict:
     if entry is not None:
         item["source_id"] = entry.source_id
         item["source_domain"] = entry.domain
-        item["organization_name"] = entry.organization_name
+        # API CONTRACT: source_name is the canonical field (maps from organization_name in DB)
+        item["source_name"] = entry.organization_name
         item["authority_tier"] = entry.authority_tier
         item["audience_type"] = entry.audience_type
     else:
         item.setdefault("source_id", None)
         item.setdefault("source_domain", None)
-        item.setdefault("organization_name", None)
+        item.setdefault("source_name", None)
         item.setdefault("authority_tier", None)
         item.setdefault("audience_type", None)
+    # chunk_id: alias to item id for evidence panel traceability (P-SRC-1)
+    # Live results (id == -1) are not traceable via /api/evidence/{chunk_id}
+    item["chunk_id"] = item.get("id")
     return item
 
 

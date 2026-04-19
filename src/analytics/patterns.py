@@ -21,6 +21,10 @@ def _pattern_confidence(co_pct: float, sample_count: int) -> str:
         return "strong_pattern"
     if co_pct >= 0.50 and sample_count >= 10:
         return "possible_pattern"
+    # Large sample size (≥30) lowers the co-occurrence bar to 25% —
+    # 30 observations is statistically meaningful even at moderate rates.
+    if co_pct >= 0.25 and sample_count >= 30:
+        return "possible_pattern"
     return "insufficient_data"
 
 
@@ -106,22 +110,29 @@ async def fetch_log_context(pool) -> str | None:
 
 # ── Insights ──────────────────────────────────────────────────────────────────
 
-async def _get_cached_insights(pool, days: int, ttl_hours: int = 1) -> dict | None:
+async def _get_cached_insights(pool, days: int) -> dict | None:
+    """Return cached insights only if no new log has been submitted since generation."""
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT insights_json FROM mzhu_test_insights_cache
+                SELECT insights_json, generated_at
+                FROM mzhu_test_insights_cache
                 WHERE days = $1
-                  AND generated_at > now() - make_interval(hours => $2)
                 ORDER BY generated_at DESC LIMIT 1
                 """,
-                days, ttl_hours,
+                days,
             )
-        if row:
-            data = row["insights_json"]
-            return json.loads(data) if isinstance(data, str) else data
-        return None
+            if row is None:
+                return None
+            last_log = await conn.fetchval(
+                "SELECT MAX(logged_at) FROM mzhu_test_logs WHERE NOT voided"
+            )
+        # Cache is valid as long as no log was submitted after it was generated
+        if last_log is not None and last_log > row["generated_at"]:
+            return None
+        data = row["insights_json"]
+        return json.loads(data) if isinstance(data, str) else data
     except Exception as e:
         log.warning("insights cache read failed: %s", e)
         return None
@@ -237,6 +248,7 @@ async def fetch_insights(pool, days: int, refresh: bool = False) -> dict:
             FROM pairs p
             JOIN trigger_totals t ON p.trigger = t.trigger
             ORDER BY p.co_count DESC
+            LIMIT 20
             """,
             days,
         )
@@ -329,7 +341,7 @@ async def fetch_insights(pool, days: int, refresh: bool = False) -> dict:
             "trigger":               r["trigger"],
             "outcome":               r["outcome"],
             "co_occurrence_count":   r["co_occurrence_count"],
-            "co_occurrence_pct":     round(r["co_occurrence_pct"], 3),
+            "co_occurrence_pct":     round(r["co_occurrence_pct"], 4),  # ratio 0-1; frontend multiplies by 100 for display
             "total_trigger_events":  r["total_trigger_events"],
             "confidence_level":      _pattern_confidence(
                                          r["co_occurrence_pct"],

@@ -11,9 +11,10 @@ Endpoints:
   GET  /api/evidence/{id}      — evidence traceability detail (P3)
   GET  /api/insights/evidence  — curated evidence per pattern (P8)
   GET  /api/insights/full      — insights + evidence + recommendations (P8)
-  POST /api/webhooks/trigger-event — safety webhook receiver (Collect P3.1)
+  POST /api/safety-webhook     — safety webhook receiver (Collect P3.1 / P-SRC-6b)
 """
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -38,11 +39,12 @@ from ..analytics.summary import get_weekly_summary
 from ..analytics.clinician import get_clinician_report
 from ..sources.registry import get_registry
 from ..search.cache import normalize_query, compute_cache_key, extract_trigger_key, check_cache, store_cache
-from ..search.trigger_policy import should_search
+from ..search.trigger_policy import should_search, fetch_and_invalidate_trigger_cache
 from ..search.ranking import compute_search_score
 from ..search.multilingual import run_multilingual_search
 from ..search.live_fallback import determine_route, run_live_search
 from ..evidence.search import fetch_curated_evidence, generate_recommendations
+from ..safety_state import set_safety_flag, get_safety_flag
 from .models import (
     SearchResponse, SearchResult, StatsResponse, HealthResponse,
     InsightsResponse, WeeklySummaryResponse, ClinicianReportResponse,
@@ -51,6 +53,7 @@ from .models import (
     PatternEvidenceResponse, InsightWithEvidenceResponse,
     PatternWithEvidence,
     TriggerEventPayload, TriggerEventResponse,
+    SafetyWebhookPayload, SafetyWebhookResponse,
 )
 from .stream import search_stream_generator
 
@@ -73,6 +76,7 @@ async def search(
     audience: str | None = Query(default=None, description="Filter by audience: parent | clinician"),
     lang: str = Query(default="en", description="Preferred language for results"),
     refresh: bool = Query(default=False, description="Bypass evidence cache"),
+    child_id: str = Query(default="default", description="Child identifier for Redis safety flag lookup"),
     pool=Depends(get_pool),
     user_pool=Depends(get_user_pool),
 ):
@@ -85,13 +89,72 @@ async def search(
     fetch_limit = effective_limit * 2   # fetch more before reranking
 
     t0 = time.monotonic()
-    log.info("search START q=%r limit=%s source=%s days=%s lang=%s audience=%s",
-             q, effective_limit, source, days, lang, audience)
+    log.info("search START q=%r limit=%s source=%s days=%s lang=%s audience=%s child_id=%s",
+             q, effective_limit, source, days, lang, audience, child_id)
 
     # ── Intent classification (add_safety.txt [1]) ─────────────────────────
     intent = classify_intent(q)
     log.info("search INTENT type=%s safety=%s conf=%.2f rule=%s",
              intent.intent_type, intent.safety_level, intent.confidence, intent.matched_rule)
+
+    # ── P-SRC-6b: Check Redis safety flag for this child ───────────────────
+    redis_safety_flag = await get_safety_flag(child_id)
+    if redis_safety_flag:
+        log.info("search REDIS_SAFETY_FLAG child_id=%s trigger=%s",
+                 child_id, redis_safety_flag.get("trigger"))
+
+    # ── P-SRC-6: Route to SAFETY_EXPANDED_MODE if applicable ───────────────
+    # Must check BEFORE cache — safety mode bypasses cache entirely
+    from ..search.live_fallback import determine_route as _determine_route
+    early_route = _determine_route([], q, intent=intent, safety_flag=redis_safety_flag)
+    if early_route == "SAFETY_EXPANDED_MODE":
+        log.info("search ROUTING to SAFETY_EXPANDED_MODE (intent=%s redis_flag=%s)",
+                 intent.intent_type, bool(redis_safety_flag))
+        from ..search.safety_expanded import run_safety_expanded_search
+        from .models import SafetySearchResponse, SafetyExtras
+        safety_result = await run_safety_expanded_search(
+            query=q, intent_type=intent.intent_type, child_id=child_id
+        )
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        # Build extras model if present
+        extras_model = None
+        extras_dict = safety_result.get("extras")
+        if extras_dict is not None:
+            extras_model = SafetyExtras(
+                cross_source_consensus=extras_dict.get("cross_source_consensus"),
+                cross_source_consensus_fallback=extras_dict.get("cross_source_consensus_fallback"),
+                key_clinical_guidance=extras_dict.get("key_clinical_guidance"),
+                key_clinical_guidance_fallback=extras_dict.get("key_clinical_guidance_fallback"),
+                urgent_help_section=extras_dict.get("urgent_help_section", "If in immediate danger, call 911. Mental health crisis line: 988 (US)."),
+            )
+
+        raw_results = safety_result.get("results", [])
+        results = []
+        for item in raw_results[:effective_limit]:
+            try:
+                results.append(SearchResult.model_validate(item))
+            except Exception as e:
+                log.debug("safety_expanded: skip invalid result: %s", e)
+
+        return SafetySearchResponse(
+            results=results,
+            total=len(results),
+            search_mode="safety_expanded",
+            search_time_ms=elapsed_ms,
+            safety_flag=True,
+            safety_incomplete=safety_result.get("safety_incomplete", False),
+            intent_type=intent.intent_type,
+            safety_level=intent.safety_level,
+            live_fallback_triggered=True,
+            extras=extras_model,
+        )
+
+    # ── P-SRC-9: Invalidate evidence cache for triggers with new log activity ──
+    if user_pool is not None:
+        await fetch_and_invalidate_trigger_cache(
+            user_pool, settings.collect_base_url, child_id=child_id,
+        )
 
     # ── P5: Trigger policy — decide if we should search or use cache ────────
     run_search = True
@@ -182,13 +245,15 @@ async def search(
     log.info("search MERGE mode=%s results=%d elapsed=%dms", mode, len(merged), int((t4 - t3) * 1000))
 
     # ── P9: routing engine — decide if live search is needed ────────────────
+    # Note: SAFETY_EXPANDED_MODE was already handled above and branched out early.
+    # This call only handles HYBRID / LIVE_ONLY / LOCAL_ONLY for normal queries.
     route = determine_route(merged, q, intent=intent)
     log.info("search ROUTE=%s local=%d intent=%s/%s", route, len(merged),
              intent.intent_type, intent.safety_level)
 
     fallback_results: list[dict] = []
     if route in ("HYBRID", "LIVE_ONLY"):
-        fallback_results = await run_live_search(q, merged)
+        fallback_results, _ = await run_live_search(q, merged)
         log.info("search LIVE rows=%d", len(fallback_results))
         # Re-merge with live search results (re-applies 5-factor ranking)
         all_kw = kw_results + live_results + fallback_results
@@ -305,18 +370,26 @@ async def search_stream(
     days: int | None = Query(default=None, ge=1, description="Only items published within N days"),
     audience: str | None = Query(default=None, description="Filter by audience: parent | clinician"),
     lang: str = Query(default="en", description="Preferred language for results"),
+    child_id: str = Query(default="default", description="Child identifier for Redis safety flag lookup"),
     pool=Depends(get_pool),
     user_pool=Depends(get_user_pool),
 ):
     """
     Streaming variant of /api/search — returns Server-Sent Events.
 
-    Event sequence:
+    Normal event sequence:
       metadata × 1     (safety_flag — emitted immediately before any LLM content)
       stage    × 4-5   (embedding → semantic → keyword → merge → agent)
       results  × 1     (source cards — sent BEFORE the LLM runs)
       agent_activity × 0-N
       summary  × 0-1
+      done     × 1
+
+    SAFETY_EXPANDED_MODE event sequence (P-SRC-6):
+      metadata × 1     (safety_flag: true)
+      stage    × 1-2   (safety_fan_out → safety_merge)
+      results  × 1     (source cards)
+      safety_extras × 0-1 (cross_source_consensus, key_clinical_guidance, urgent_help_section)
       done     × 1
 
     Falls back through two tiers: streaming agent → single-shot summarize(),
@@ -328,11 +401,12 @@ async def search_stream(
         settings.max_result_limit,
     )
     log.info(
-        "search_stream START q=%r limit=%s source=%s days=%s",
-        q, effective_limit, source, days,
+        "search_stream START q=%r limit=%s source=%s days=%s child_id=%s",
+        q, effective_limit, source, days, child_id,
     )
     return StreamingResponse(
-        search_stream_generator(q, effective_limit, source, days, pool, user_pool),
+        search_stream_generator(q, effective_limit, source, days, pool, user_pool,
+                                child_id=child_id, lang=lang),
         media_type="text/event-stream",
         headers={
             "Cache-Control":     "no-cache",
@@ -481,7 +555,7 @@ async def list_sources():
     items = [
         SourceListItem(
             source_id=s.source_id,
-            organization_name=s.organization_name,
+            source_name=s.organization_name,
             authority_tier=s.authority_tier,
             source_type=s.source_type,
             audience_type=s.audience_type,
@@ -490,6 +564,7 @@ async def list_sources():
             country=s.country,
             domain=s.domain,
             is_active=s.is_active,
+            access_mode=s.access_mode,
         )
         for s in active
     ]
@@ -533,7 +608,7 @@ async def get_evidence(chunk_id: int, pool=Depends(get_pool)):
         chunk_id=chunk_id,
         source_id=entry.source_id if entry else None,
         source_domain=entry.domain if entry else None,
-        organization_name=entry.organization_name if entry else None,
+        source_name=entry.organization_name if entry else None,
         authority_tier=entry.authority_tier if entry else None,
         audience_type=entry.audience_type if entry else None,
         page_title=row.get("title") or "(untitled)",
@@ -561,7 +636,7 @@ async def insights_evidence(
     query = f"{trigger} autism"
     if outcome:
         query += f" {outcome}"
-    cards = await fetch_curated_evidence(pool, query, limit)
+    cards, _ = await fetch_curated_evidence(pool, query, limit)
     return PatternEvidenceResponse(
         trigger=trigger,
         outcome=outcome,
@@ -571,6 +646,46 @@ async def insights_evidence(
 
 
 # ── /api/insights/full (P8) ─────────────────────────────────────────────────
+
+async def _get_cached_insights_full(user_pool, days: int) -> dict | None:
+    """Return cached full insights if no new log has been submitted since generation."""
+    try:
+        async with user_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT response_json, generated_at FROM mzhu_test_insights_full_cache
+                WHERE days = $1
+                ORDER BY generated_at DESC LIMIT 1
+                """,
+                days,
+            )
+            if row is None:
+                return None
+            last_log = await conn.fetchval(
+                "SELECT MAX(logged_at) FROM mzhu_test_logs WHERE NOT voided"
+            )
+        if last_log is not None and last_log > row["generated_at"]:
+            return None
+        data = row["response_json"]
+        return json.loads(data) if isinstance(data, str) else data
+    except Exception as e:
+        log.warning("insights_full cache read failed: %s", e)
+        return None
+
+
+async def _persist_insights_full(user_pool, days: int, response: dict) -> None:
+    try:
+        async with user_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO mzhu_test_insights_full_cache (days, response_json) VALUES ($1, $2::jsonb)",
+                days, json.dumps(response, default=str),
+            )
+            await conn.execute(
+                "DELETE FROM mzhu_test_insights_full_cache WHERE generated_at < now() - interval '24 hours'",
+            )
+    except Exception as e:
+        log.warning("insights_full cache write failed: %s", e)
+
 
 @router.get("/insights/full", response_model=InsightWithEvidenceResponse)
 async def insights_full(
@@ -586,6 +701,11 @@ async def insights_full(
     """
     if user_pool is None:
         raise HTTPException(status_code=503, detail="User database not configured")
+
+    if not refresh:
+        cached = await _get_cached_insights_full(user_pool, days)
+        if cached:
+            return {**cached, "cached": True}
 
     try:
         # Fetch base insights
@@ -616,9 +736,10 @@ async def insights_full(
             is_safety = trigger in _SAFETY_TRIGGERS or outcome in _SAFETY_TRIGGERS
             should_enrich = enriched_count < 3 or is_safety
 
+            live_sites_searched = 0
             if should_enrich:
                 query = f"{trigger} {outcome} autism"
-                evidence = await fetch_curated_evidence(pool, query, limit=3)
+                evidence, live_sites_searched = await fetch_curated_evidence(pool, query, limit=3)
                 recommendations = await generate_recommendations(p, evidence)
                 enriched_count += 1
 
@@ -633,6 +754,7 @@ async def insights_full(
                 raw_signals=raw_signals_by_trigger.get(trigger, []),
                 evidence=evidence,
                 recommendations=recommendations,
+                live_sites_searched=live_sites_searched,
             ))
 
         # Surface safety triggers that appear in top_triggers but have
@@ -644,7 +766,7 @@ async def insights_full(
             trig = tt.get("trigger", "")
             if trig in _SAFETY_TRIGGERS and trig not in pattern_triggers:
                 query = f"{trig} autism"
-                evidence = await fetch_curated_evidence(pool, query, limit=3)
+                evidence, live_sites_searched = await fetch_curated_evidence(pool, query, limit=3)
                 synthetic_pattern = {
                     "trigger": trig,
                     "outcome": "",
@@ -663,9 +785,10 @@ async def insights_full(
                     raw_signals=raw_signals_by_trigger.get(trig, []),
                     evidence=evidence,
                     recommendations=recommendations,
+                    live_sites_searched=live_sites_searched,
                 ))
 
-        return InsightWithEvidenceResponse(
+        response = InsightWithEvidenceResponse(
             top_triggers=base.get("top_triggers", []),
             top_outcomes=base.get("top_outcomes", []),
             patterns=patterns_enriched,
@@ -674,8 +797,10 @@ async def insights_full(
             date_range=base.get("date_range", {}),
             daily_check_trends=base.get("daily_check_trends", {}),
             generated_at=datetime.now(timezone.utc).isoformat(),
-            cached=base.get("cached", False),
+            cached=False,
         )
+        await _persist_insights_full(user_pool, days, response.dict())
+        return response
 
     except HTTPException:
         raise
@@ -684,32 +809,38 @@ async def insights_full(
         raise HTTPException(status_code=503, detail={"error": "insights full failed", "detail": str(e)})
 
 
-# ── /api/webhooks/trigger-event (Collect P3.1) ──────────────────────────────
+# ── /api/safety-webhook (Collect P3.1 / P-SRC-6b) ───────────────────────────
 
-@router.post("/webhooks/trigger-event", response_model=TriggerEventResponse)
-async def receive_trigger_event(
-    payload: TriggerEventPayload,
+@router.post("/safety-webhook", response_model=SafetyWebhookResponse)
+async def receive_safety_webhook(
+    payload: SafetyWebhookPayload,
     pool=Depends(get_pool),
     user_pool=Depends(get_user_pool),
 ):
     """
-    Receive safety/trigger webhook from the collect service.
+    Receive safety webhook from the collect service (P-SRC-6b).
 
-    When a safety-critical log is created (e.g. self_harm, aggression, severity >= 4),
-    collect POSTs here. This endpoint runs a proactive search + live search
-    and caches the results so they're ready when the user opens the app.
+    Canonical endpoint: POST /api/safety-webhook
+    Called when a safety-critical log is created (e.g. self_harm, severity >= 4).
+    Sets the Redis safety flag for the child so that subsequent search requests
+    activate SAFETY_EXPANDED_MODE.
+    Also runs a proactive search and caches results for instant retrieval.
     """
     from datetime import date as date_type
 
-    log.info("webhook RECEIVED event=%s trigger=%s severity=%s",
-             payload.event_type, payload.trigger, payload.severity)
+    log.info("safety_webhook RECEIVED event_id=%s child_id=%s trigger=%s severity=%s",
+             payload.event_id, payload.child_id, payload.trigger_type, payload.severity)
+
+    # ── P-SRC-6b: Set Redis safety flag for this child ─────────────────────
+    await set_safety_flag(payload.child_id, payload.trigger_type)
+    log.info("safety_webhook REDIS_SET child_id=%s trigger=%s", payload.child_id, payload.trigger_type)
 
     # Build a search query from the trigger
-    query = f"{payload.trigger.replace('_', ' ')} autism"
+    query = f"{payload.trigger_type.replace('_', ' ')} autism"
 
     # Classify intent (will detect safety)
     intent = classify_intent(query)
-    log.info("webhook INTENT type=%s safety=%s", intent.intent_type, intent.safety_level)
+    log.info("safety_webhook INTENT type=%s safety=%s", intent.intent_type, intent.safety_level)
 
     # Run the search pipeline (same as /api/search but without LLM summary)
     t0 = time.monotonic()
@@ -727,7 +858,88 @@ async def receive_trigger_event(
     route = determine_route(merged, query, intent=intent)
     fallback_results: list[dict] = []
     if route in ("HYBRID", "LIVE_ONLY"):
-        fallback_results = await run_live_search(query, merged)
+        fallback_results, _ = await run_live_search(query, merged)
+        if fallback_results:
+            all_kw = kw_results + fallback_results
+            merged, mode = merge_and_rerank(sem_results, all_kw, top_n=20, query_text=query)
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    results_count = len(merged)
+
+    # Cache proactively so next user search is instant
+    cached_count = 0
+    if user_pool is not None and merged:
+        try:
+            normalized = normalize_query(query)
+            cache_key = compute_cache_key(normalized, "en", date_type.today())
+            trigger_key = extract_trigger_key(query)
+            await store_cache(
+                user_pool, cache_key, trigger_key, "en", date_type.today(), query,
+                retrieval_results=merged[:10],
+                extracted_evidence=None,
+                ttl_hours=24,
+            )
+            cached_count = min(len(merged), 10)
+            log.info("safety_webhook CACHED key=%s results=%d", cache_key[:16], cached_count)
+        except Exception as e:
+            log.warning("safety_webhook cache failed: %s", e)
+
+    log.info(
+        "safety_webhook DONE event_id=%s trigger=%s results=%d live=%d elapsed=%dms cached=%d",
+        payload.event_id, payload.trigger_type, results_count,
+        len(fallback_results), elapsed_ms, cached_count,
+    )
+
+    return SafetyWebhookResponse(
+        status="ok",
+        event_id=payload.event_id,
+        child_id=payload.child_id,
+        trigger_type=payload.trigger_type,
+        safety_flag_set=True,
+        results_cached=cached_count,
+    )
+
+
+# ── /api/webhooks/trigger-event (legacy alias — kept for backward compat) ───
+
+@router.post("/webhooks/trigger-event", response_model=TriggerEventResponse)
+async def receive_trigger_event(
+    payload: TriggerEventPayload,
+    pool=Depends(get_pool),
+    user_pool=Depends(get_user_pool),
+):
+    """
+    Legacy endpoint — kept for backward compatibility.
+    New code should use POST /api/safety-webhook instead.
+    """
+    from datetime import date as date_type
+
+    log.info("webhook (legacy) RECEIVED event=%s trigger=%s severity=%s",
+             payload.event_type, payload.trigger, payload.severity)
+
+    # Build a search query from the trigger
+    query = f"{payload.trigger.replace('_', ' ')} autism"
+
+    # Classify intent (will detect safety)
+    intent = classify_intent(query)
+
+    # Run the search pipeline (same as /api/search but without LLM summary)
+    t0 = time.monotonic()
+
+    embedding = await embed_query(query)
+    sem_results: list[dict] = []
+    if embedding is not None:
+        sem_results = await semantic_search(pool, embedding, 20)
+
+    kw_results = await keyword_search(pool, query, 20)
+
+    merged, mode = merge_and_rerank(sem_results, kw_results, top_n=20, query_text=query)
+
+    # Force live search for safety events
+    route = determine_route(merged, query, intent=intent)
+    fallback_results: list[dict] = []
+    if route in ("HYBRID", "LIVE_ONLY"):
+        fallback_results, _ = await run_live_search(query, merged)
         if fallback_results:
             all_kw = kw_results + fallback_results
             merged, mode = merge_and_rerank(sem_results, all_kw, top_n=20, query_text=query)
