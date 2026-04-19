@@ -9,16 +9,99 @@ keyword sets. Safety queries always bypass cache.
 """
 
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 
-from .cache import check_cache, compute_cache_key, normalize_query, extract_trigger_key
+import httpx
+
+from .cache import check_cache, compute_cache_key, normalize_query, extract_trigger_key, invalidate_by_trigger
 from .intent_classifier import IntentResult
 
 log = logging.getLogger(__name__)
 
+# Module-level dict storing last-seen `last_seen` datetime per trigger_key.
+# Resets on service restart — acceptable per spec.
+_trigger_last_seen: dict[str, datetime] = {}
+
 # Minimum cache freshness threshold — if cached evidence has fewer than this
 # many results, re-search even if cache is valid
 _MIN_CACHED_RESULTS = 2
+
+
+async def fetch_and_invalidate_trigger_cache(
+    user_pool,
+    collect_base_url: str,
+    child_id: str = "default",
+) -> None:
+    """Fetch /logs/trigger-signals from collect and invalidate stale evidence cache entries.
+
+    For each trigger signal returned, compares `last_seen` against the last-known
+    value stored in `_trigger_last_seen`. If it has advanced (new log events), any
+    evidence_cache rows keyed to that trigger are deleted so the next search fetches
+    fresh results.
+
+    Runs silently — any fetch or DB failure is logged at WARNING and the pipeline
+    continues unaffected.
+
+    If the response does not include `last_seen` per trigger, invalidation is skipped.
+    """
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=5.0) as client:
+            resp = await client.get(
+                f"{collect_base_url}/logs/trigger-signals",
+                params={"child_id": child_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        log.warning("fetch_and_invalidate_trigger_cache: could not fetch trigger-signals: %s", e)
+        return
+
+    if not isinstance(data, dict):
+        log.warning(
+            "fetch_and_invalidate_trigger_cache: unexpected response schema "
+            "(expected dict, got %s) — skipping invalidation",
+            type(data).__name__,
+        )
+        return
+
+    trigger_signals = data.get("trigger_signals")
+    if not trigger_signals or not isinstance(trigger_signals, list):
+        return
+
+    for signal in trigger_signals:
+        trigger_key = signal.get("trigger")
+        last_seen_raw = signal.get("last_seen")
+
+        if not trigger_key or last_seen_raw is None:
+            # Skip if response doesn't include the expected fields
+            continue
+
+        try:
+            if isinstance(last_seen_raw, str):
+                last_seen = datetime.fromisoformat(last_seen_raw.replace("Z", "+00:00"))
+            elif isinstance(last_seen_raw, datetime):
+                last_seen = last_seen_raw
+            else:
+                continue
+
+            # Normalise to UTC-aware
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+
+        prev = _trigger_last_seen.get(trigger_key)
+
+        if prev is not None and last_seen > prev:
+            # New log events recorded for this trigger — invalidate stale cache
+            log.debug(
+                "trigger cache invalidation: trigger=%s last_seen advanced %s → %s",
+                trigger_key, prev.isoformat(), last_seen.isoformat(),
+            )
+            await invalidate_by_trigger(user_pool, trigger_key)
+
+        # Always update the remembered timestamp
+        _trigger_last_seen[trigger_key] = last_seen
 
 
 async def should_search(

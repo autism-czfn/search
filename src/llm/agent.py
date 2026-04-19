@@ -20,9 +20,11 @@ import time
 import uuid
 from pathlib import Path
 
+from ..config import settings
+
 log = logging.getLogger(__name__)
 
-AGENT_TIMEOUT = 60    # seconds — longer than summarize (30s) to allow tool calls
+AGENT_TIMEOUT = settings.agent_timeout_seconds  # configurable via AGENT_TIMEOUT_SECONDS env var
 TOP_N_INITIAL =  5    # results written to temp file
 
 

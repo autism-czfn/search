@@ -93,24 +93,41 @@ async def _compute_weekly_stats(pool, week_start: date, week_end: date) -> dict:
 # ── Step 2: cache check ───────────────────────────────────────────────────────
 
 async def _get_cached_summary(pool, week_start: date) -> dict | None:
+    """Return cached summary only if no new log or daily check has been submitted since generation."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT summary_text, stats_json, generated_at
             FROM mzhu_test_summaries
             WHERE week_start = $1
+            ORDER BY generated_at DESC LIMIT 1
             """,
             week_start,
         )
-    if row is None:
-        return None
+        if row is None:
+            return None
 
-    generated_at: datetime = row["generated_at"]
-    if generated_at.tzinfo is None:
-        generated_at = generated_at.replace(tzinfo=timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - generated_at).total_seconds() / 3600
-    if age_hours >= 24:
-        return None
+        generated_at: datetime = row["generated_at"]
+        if generated_at.tzinfo is None:
+            generated_at = generated_at.replace(tzinfo=timezone.utc)
+
+        last_log = await conn.fetchval(
+            "SELECT MAX(logged_at) FROM mzhu_test_logs WHERE NOT voided"
+        )
+        last_check = await conn.fetchval(
+            "SELECT MAX(updated_at) FROM mzhu_test_daily_checks"
+        )
+
+    # Cache is valid as long as neither logs nor daily checks have new data
+    last_activity = max(
+        t for t in (last_log, last_check) if t is not None
+    ) if any(t is not None for t in (last_log, last_check)) else None
+
+    if last_activity is not None:
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        if last_activity > generated_at:
+            return None
 
     return {
         "summary_text": row["summary_text"],
@@ -184,8 +201,8 @@ async def _persist(collect_base_url: str, week_start: date, summary_text: str, s
 
 async def get_weekly_summary(user_pool, collect_base_url: str) -> dict:
     today      = date.today()
-    week_start = today - timedelta(days=today.weekday())   # Monday
-    week_end   = week_start + timedelta(days=6)            # Sunday
+    week_start = today - timedelta(days=6)   # rolling past 7 days
+    week_end   = today
 
     stats = await _compute_weekly_stats(user_pool, week_start, week_end)
 

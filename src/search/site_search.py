@@ -104,12 +104,26 @@ def _extract_json_results(data: dict | list, config: dict) -> list[dict]:
         # Build URL
         url = ""
         if url_field:
-            url = (_resolve_dotpath(item, url_field) if "." in url_field else item.get(url_field, "")) or ""
+            val = (_resolve_dotpath(item, url_field) if "." in url_field else item.get(url_field, "")) or ""
+            # Handle list-of-dicts (e.g. DOAJ bibjson.link = [{type, url}, ...])
+            if isinstance(val, list):
+                for entry in val:
+                    if isinstance(entry, dict) and entry.get("url"):
+                        val = entry["url"]
+                        break
+                else:
+                    val = ""
+            url = str(val) if val else ""
         elif url_template:
             try:
-                # Flatten nested dicts for template substitution
-                url = url_template.format(**item)
-            except (KeyError, IndexError):
+                # Support dot-path keys in template e.g. {protocolSection.identificationModule.nctId}
+                resolved = url_template
+                for m in re.finditer(r"\{([^}]+)\}", url_template):
+                    key = m.group(1)
+                    value = _resolve_dotpath(item, key) if "." in key else item.get(key, "")
+                    resolved = resolved.replace(m.group(0), str(value or ""))
+                url = resolved
+            except Exception:
                 url = ""
 
         snippet = ""
@@ -218,9 +232,20 @@ async def _search_sitemap_index(
             resp = await client.get(base_url, follow_redirects=True)
             if resp.status_code != 200:
                 return []
-            # Extract all internal links
+            # Use only scheme+host for link reconstruction (base_url may be a sub-path)
+            from urllib.parse import urlparse
+            parsed = urlparse(base_url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            url_prefix = config.get("url_prefix", "")
             links = re.findall(r'href="(/[^"]*)"', resp.text)
-            page_urls = list({base_url.rstrip("/") + link for link in links if not link.startswith("#")})
+            page_urls = list({
+                origin + link
+                for link in links
+                if not link.startswith("#")
+                and "." not in link.split("/")[-1]   # skip .css/.js/.png etc
+                and "?" not in link                   # skip query-string hrefs
+                and (not url_prefix or link.startswith(url_prefix))
+            })
             page_urls = page_urls[:30]  # cap at 30 pages
             _sitemap_cache[domain] = (today, page_urls)
         except Exception as e:
@@ -229,6 +254,7 @@ async def _search_sitemap_index(
 
     # Search pages for query relevance
     query_terms = set(query.lower().split())
+    min_match = config.get("min_match_terms", 2)
     results = []
     max_results = config.get("max_results", 5)
 
@@ -240,9 +266,9 @@ async def _search_sitemap_index(
             text = re.sub(r"<[^>]+>", " ", resp.text)
             text_lower = text.lower()
 
-            # Check relevance: at least 2 query terms appear
+            # Check relevance: at least min_match_terms query terms appear
             matched = sum(1 for t in query_terms if t in text_lower)
-            if matched < 2:
+            if matched < min_match:
                 continue
 
             # Extract title from <title> tag
@@ -288,7 +314,7 @@ async def live_search_site(
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            headers={"User-Agent": "AutismSearchBot/1.0 (research; contact@example.com)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; autism-research/1.0)"},
         ) as client:
 
             if method == "api":

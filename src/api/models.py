@@ -43,8 +43,13 @@ class SearchResult(BaseModel):
     engagement: dict[str, Any] | None = None  # {comments, upvotes, shares, ...}
 
     # --- source registry metadata (added by search service via hybrid.py) ---
-    organization_name: str | None = Field(
-        None, description="Human-readable source org name from registry"
+    # API CONTRACT (P-SRC-1): source_name is canonical (mapped from organization_name in DB)
+    source_name: str | None = Field(
+        None, description="Human-readable source org name from registry (canonical API field)"
+    )
+    # chunk_id: required by P1.2 evidence panel — aliased to id for local results
+    chunk_id: int | None = Field(
+        None, description="chunk_id for GET /api/evidence/{chunk_id}; null for live results"
     )
     authority_tier: int | None = Field(
         None, description="1 (official), 2 (academic), 3 (nonprofit), null (unknown)"
@@ -252,7 +257,7 @@ class ClinicianReportResponse(BaseModel):
 
 class SourceListItem(BaseModel):
     source_id: str
-    organization_name: str
+    source_name: str = Field(description="Human-readable source name (canonical API field)")
     authority_tier: int | None = None
     source_type: str
     audience_type: str
@@ -261,6 +266,7 @@ class SourceListItem(BaseModel):
     country: str | None = None
     domain: str
     is_active: bool
+    access_mode: str = Field(description="How content is accessed: 'crawl' | 'api' | 'live_search'")
 
 
 class SourceListResponse(BaseModel):
@@ -274,7 +280,7 @@ class EvidenceResponse(BaseModel):
     chunk_id: int
     source_id: str | None = None
     source_domain: str | None = None
-    organization_name: str | None = None
+    source_name: str | None = Field(None, description="Human-readable source name (canonical API field)")
     authority_tier: int | None = None
     audience_type: str | None = None
     page_title: str
@@ -289,7 +295,7 @@ class EvidenceResponse(BaseModel):
 
 class EvidenceCard(BaseModel):
     source_title: str
-    organization_name: str
+    source_name: str = Field(description="Human-readable source name (canonical API field)")
     publication_type: str | None = None
     link: str | None = None
     summary: str
@@ -319,6 +325,7 @@ class PatternWithEvidence(BaseModel):
     raw_signals: list[str] = Field(default_factory=list)
     evidence: list[EvidenceCard]
     recommendations: list[InsightRecommendation]
+    live_sites_searched: int = Field(0, description="Number of websites queried during live search for this pattern")
 
 
 class InsightWithEvidenceResponse(BaseModel):
@@ -349,3 +356,69 @@ class TriggerEventResponse(BaseModel):
     event_type: str
     search_triggered: bool
     results_cached: int = 0
+
+
+# ── Safety webhook models (P-SRC-6b — canonical endpoint) ─────────────────
+
+class SafetyWebhookPayload(BaseModel):
+    """Canonical safety webhook payload from collect service (P-SRC-6b)."""
+    event_id: str = Field(description="Unique event ID (UUID from collect)")
+    child_id: str = Field(description="Child identifier")
+    trigger_type: str = Field(description='"self_harm" | "violence" | "abuse" | "elopement" | "aggression" | "emergency"')
+    severity: int | None = Field(None, description="Integer severity 1-5")
+    raw_text: str | None = Field(None, description="Original caregiver language preserved")
+    normalized_intent: str | None = Field(None, description="Collect's classified intent label")
+    timestamp: str | None = Field(None, description="ISO 8601 timestamp")
+    source: str = Field("collect", description='Always "collect"')
+
+
+class SafetyWebhookResponse(BaseModel):
+    status: str
+    event_id: str
+    child_id: str
+    trigger_type: str
+    safety_flag_set: bool
+    results_cached: int = 0
+
+
+# ── Safety search response extras ─────────────────────────────────────────
+
+class SafetyExtras(BaseModel):
+    """Extra fields returned in SAFETY_EXPANDED_MODE for self_harm intent."""
+    cross_source_consensus: str | None = Field(
+        None, description="LLM-generated summary across sources; null if LLM failed"
+    )
+    cross_source_consensus_fallback: str | None = Field(
+        None, description='"Insufficient model response" if LLM failed'
+    )
+    key_clinical_guidance: str | None = Field(
+        None, description="Bullet points of actionable guidance; null if LLM failed"
+    )
+    key_clinical_guidance_fallback: str | None = Field(
+        None, description='"Insufficient model response" if LLM failed'
+    )
+    urgent_help_section: str = Field(
+        description="When to seek urgent help — ALWAYS present (hardcoded fallback if LLM fails)"
+    )
+
+
+class SafetySearchResponse(BaseModel):
+    """Response model for SAFETY_EXPANDED_MODE searches."""
+    results: list[SearchResult]
+    total: int
+    search_mode: str = "safety_expanded"
+    search_time_ms: int
+    summary: str | None = None
+    fallback_message: str | None = None
+    llm_time_ms: int | None = None
+    agent_iterations: int | None = None
+    # Safety fields — always present in safety mode
+    safety_flag: bool = True
+    safety_incomplete: bool = Field(
+        False, description="True if diversity constraints could not be met after Phase 1+2"
+    )
+    intent_type: str | None = None
+    safety_level: str | None = None
+    live_fallback_triggered: bool = True
+    # Extras — present for self_harm intent
+    extras: SafetyExtras | None = None

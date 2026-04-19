@@ -38,9 +38,11 @@ import uuid
 from pathlib import Path
 from typing import AsyncGenerator
 
+from ..config import settings
+
 log = logging.getLogger(__name__)
 
-AGENT_TIMEOUT    = 60       # seconds
+AGENT_TIMEOUT    = settings.agent_timeout_seconds  # configurable via AGENT_TIMEOUT_SECONDS env var
 TOP_N_INITIAL    = 5        # results written to temp file
 
 
