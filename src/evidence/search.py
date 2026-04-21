@@ -85,14 +85,17 @@ async def fetch_curated_evidence(
 
     sem_results = []
     if embedding is not None:
-        sem_results = await semantic_search(pool, embedding, fetch_n, None, None)
+        sem_results = await semantic_search(pool, embedding, fetch_n, None, None,
+                                            official_only=True)
 
-    kw_results = await keyword_search(pool, query, fetch_n, None, None)
+    kw_results = await keyword_search(pool, query, fetch_n, None, None,
+                                      official_only=True)
 
     if not sem_results and not kw_results:
         return [], 0
 
-    merged, _mode = merge_and_rerank(sem_results, kw_results, top_n=fetch_n)
+    merged, _mode = merge_and_rerank(sem_results, kw_results, top_n=fetch_n,
+                                     official_only=True)
 
     # ── Live search: supplement if local results are weak ────────────────
     live_sites_searched = 0

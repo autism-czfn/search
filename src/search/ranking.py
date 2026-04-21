@@ -100,16 +100,41 @@ def _source_authority(item: dict) -> float:
 
 
 def _trigger_match(item: dict, query_text: str) -> float:
-    """Keyword overlap between query and trigger vocabulary."""
+    """Relevance of result content to the trigger terms found in the query.
+
+    Two-level check:
+      - Trigger terms found in title/description → full credit (1.0 per hit)
+      - Trigger terms found only in content_body → partial credit (0.4 per hit)
+      - Trigger terms absent from result entirely → 0.0
+    This prevents high-authority but off-topic pages (e.g. a generic NHS
+    'what is autism' page) from outranking pages whose content is actually
+    about the queried topic.
+    """
     if not query_text:
         return 0.5
     words = set(query_text.lower().split())
-    matches = words & _TRIGGER_TERMS
-    if not matches:
-        # Fallback to semantic_score if available
+    query_triggers = words & _TRIGGER_TERMS
+    if not query_triggers:
+        # No trigger terms in query — fall back to semantic score
         return item.get("semantic_score", 0.5)
-    # Score = proportion of query words that are known triggers
-    return min(1.0, len(matches) / max(1, len(words)))
+
+    # Title + description: prominent match signals genuine topic relevance
+    title_desc = " ".join([
+        item.get("title", "") or "",
+        item.get("description", "") or "",
+    ]).lower()
+    title_hits = query_triggers & set(title_desc.split())
+    if title_hits:
+        return min(1.0, len(title_hits) / len(query_triggers))
+
+    # content_body only: incidental mention, penalise heavily
+    body = (item.get("content_body", "") or "").lower()
+    body_hits = query_triggers & set(body.split())
+    if body_hits:
+        return min(1.0, 0.4 * len(body_hits) / len(query_triggers))
+
+    # Trigger terms not found anywhere in this result
+    return 0.0
 
 
 def _context_match(item: dict, log_context: dict | None) -> float:
@@ -207,9 +232,23 @@ def compute_search_score(
 ) -> float:
     """Compute the 5-factor search result ranking score."""
     w = SEARCH_WEIGHTS
+    trigger = _trigger_match(item, query_text)
+
+    # Hard-zero guard: if the query contains recognized trigger terms but none
+    # appear anywhere in this result (title, description, or content_body),
+    # the result is off-topic and must be excluded regardless of source
+    # authority. This enforces the intent stated in _trigger_match's docstring
+    # — a tier-1 authority score (0.40) must not rescue an off-topic result
+    # that correctly received trigger_match=0.0.
+    # Example: NHS "What is autism?" must not surface for a food-pattern query.
+    if trigger == 0.0 and query_text:
+        words = set(query_text.lower().split())
+        if words & _TRIGGER_TERMS:
+            return 0.0
+
     score = (
         w["source_authority"] * _source_authority(item)
-        + w["trigger_match"] * _trigger_match(item, query_text)
+        + w["trigger_match"] * trigger
         + w["context_match"] * _context_match(item, log_context)
         + w["language_match"] * _language_match(item, user_lang, cross_lingual, target_lang)
         + w["recency"] * _recency(item)

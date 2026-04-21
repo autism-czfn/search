@@ -8,6 +8,8 @@ Returns up to *fetch_limit* rows ordered by ts_rank DESC.
 import logging
 import asyncpg
 
+from ..sources.registry import get_registry
+
 log = logging.getLogger(__name__)
 
 # Columns fetched by every search variant (no embedding, no raw_payload)
@@ -37,6 +39,7 @@ async def keyword_search(
     source: str | None = None,
     days: int | None = None,
     fts_config: str = "english",
+    official_only: bool = False,
 ) -> list[dict]:
     """
     Full-text search. Returns a list of dicts with a 'keyword_score' key.
@@ -47,6 +50,9 @@ async def keyword_search(
             'english' (default) — standard English stemming/stopwords.
             'simple' — language-agnostic (splits on whitespace, lowercases).
                        Use for non-English queries (P7 multilingual search).
+        official_only: When True, restricts results to authority_tier=1 (official)
+            sources only (e.g. CDC, NIH, NHS, NICE). Non-official crawled items
+            are excluded at the SQL level for efficiency.
     """
     # Validate fts_config to prevent SQL injection (only allow known configs)
     if fts_config not in ("english", "simple", "french", "german", "spanish"):
@@ -66,6 +72,15 @@ async def keyword_search(
         extra_filters.append(f"AND published_at >= now() - (${p}::int || ' days')::interval")
         params.append(days)
         p += 1
+
+    if official_only:
+        official_keys = get_registry().get_official_surface_keys()
+        if official_keys:
+            extra_filters.append(f"AND surface_key = ANY(${p}::text[])")
+            params.append(official_keys)
+            p += 1
+        else:
+            log.warning("keyword_search: official_only=True but registry has no tier-1 sources — filter skipped")
 
     filters_sql = "\n        ".join(extra_filters)
 

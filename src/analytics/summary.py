@@ -93,16 +93,14 @@ async def _compute_weekly_stats(pool, week_start: date, week_end: date) -> dict:
 # ── Step 2: cache check ───────────────────────────────────────────────────────
 
 async def _get_cached_summary(pool, week_start: date) -> dict | None:
-    """Return cached summary only if no new log or daily check has been submitted since generation."""
+    """Return the most recent cached summary if no new log or daily check has been submitted since generation."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT summary_text, stats_json, generated_at
             FROM mzhu_test_summaries
-            WHERE week_start = $1
             ORDER BY generated_at DESC LIMIT 1
             """,
-            week_start,
         )
         if row is None:
             return None

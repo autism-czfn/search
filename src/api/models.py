@@ -381,6 +381,28 @@ class SafetyWebhookResponse(BaseModel):
     results_cached: int = 0
 
 
+# ── chat-search models (POST /api/chat-search) ───────────────────────────
+
+class ChatSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, description="Search query text")
+    limit: int = Field(5, ge=1, description="Max results to return; capped at max_result_limit")
+    audience: str | None = Field(None, description="Filter by audience: parent | clinician")
+
+
+class ChatSearchResult(BaseModel):
+    title: str
+    url: str
+    snippet: str | None = Field(None, description="description field; fallback content_body[:300]")
+    source: str | None = Field(None, description="Human-readable org name from source registry")
+    score: float = Field(0.0, description="5-factor combined_score 0.0-1.0")
+
+
+class ChatSearchResponse(BaseModel):
+    results: list[ChatSearchResult]
+    sites_attempted: int = Field(0, description="Number of websites queried during live search")
+    search_query: str | None = Field(None, description="Transformed search query actually used (may differ from original)")
+
+
 # ── Safety search response extras ─────────────────────────────────────────
 
 class SafetyExtras(BaseModel):

@@ -48,17 +48,20 @@ async def main() -> None:
         sem_results: list[dict] = []
         if embedding is not None:
             sem_results = await semantic_search(
-                pool, embedding, args.limit * 2, args.source, args.days
+                pool, embedding, args.limit * 2, args.source, args.days,
+                official_only=True,
             )
         kw_results = await keyword_search(
-            pool, args.query, args.limit * 2, args.source, args.days
+            pool, args.query, args.limit * 2, args.source, args.days,
+            official_only=True,
         )
 
         if not sem_results and not kw_results:
             print(json.dumps([]))
             return
 
-        merged, _ = merge_and_rerank(sem_results, kw_results, top_n=args.limit)
+        merged, _ = merge_and_rerank(sem_results, kw_results, top_n=args.limit,
+                                     official_only=True)
 
         # Serialise — datetime fields are not JSON-serialisable
         output = []
