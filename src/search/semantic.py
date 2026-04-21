@@ -10,6 +10,8 @@ Returns [] (triggers keyword-only fallback) when:
 import logging
 import asyncpg
 
+from ..sources.registry import get_registry
+
 log = logging.getLogger(__name__)
 
 _SELECT = """
@@ -26,11 +28,17 @@ async def semantic_search(
     fetch_limit: int = 20,
     source: str | None = None,
     days: int | None = None,
+    official_only: bool = False,
 ) -> list[dict]:
     """
     Cosine-similarity search using pgvector.
     Returns a list of dicts with a 'semantic_score' key (cosine similarity 0–1).
     Returns [] on cold start, no embeddings, or any error.
+
+    Args:
+        official_only: When True, restricts results to authority_tier=1 (official)
+            sources only (e.g. CDC, NIH, NHS, NICE). Non-official crawled items
+            are excluded at the SQL level for efficiency.
     """
     params: list = [embedding]
     extra_filters: list[str] = []
@@ -45,6 +53,15 @@ async def semantic_search(
         extra_filters.append(f"AND published_at >= now() - (${p}::int || ' days')::interval")
         params.append(days)
         p += 1
+
+    if official_only:
+        official_keys = get_registry().get_official_surface_keys()
+        if official_keys:
+            extra_filters.append(f"AND surface_key = ANY(${p}::text[])")
+            params.append(official_keys)
+            p += 1
+        else:
+            log.warning("semantic_search: official_only=True but registry has no tier-1 sources — filter skipped")
 
     filters_sql = "\n        ".join(extra_filters)
 

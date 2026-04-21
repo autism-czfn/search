@@ -23,6 +23,7 @@ from ..config import settings as app_settings
 from ..sources.registry import get_registry
 from .intent_classifier import IntentResult
 from .site_search import load_live_search_configs, live_search_all, adapt_live_results
+from .pubmed import pubmed_search as _pubmed_search
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ async def run_live_search(
         and s.source_id in ls_configs
     ]
 
-    # Sort by authority tier (tier 1 first)
+    # Sort by authority tier (tier 1 first, then tier 2, then tier 3)
     candidates.sort(key=lambda s: s.authority_tier or 99)
 
     # Limit sites to search
@@ -166,11 +167,36 @@ async def run_live_search(
     site_names = [t.source_id for t in targets]
     log.info("LIVE sites=%s", ",".join(site_names))
 
-    # Search in parallel
+    # ── PubMed: use proper 2-step API (esearch → esummary) ──────────────────
+    # The generic live_search_site() path only does esearch (returns raw IDs,
+    # not articles). pubmed_search() does both steps and returns real titles/URLs.
+    pubmed_raw: list[dict] = []
+    pubmed_targets = [t for t in targets if t.source_id == "pubmed"]
+    other_targets  = [t for t in targets if t.source_id != "pubmed"]
+
+    if pubmed_targets:
+        try:
+            from ..config import settings as _s
+            articles = await _pubmed_search(query, max_results=5,
+                                            api_key=getattr(_s, "ncbi_api_key", None))
+            for art in articles:
+                pubmed_raw.append({
+                    "title":     art["title"],
+                    "url":       art["url"],
+                    "snippet":   f"{art.get('journal', '')} · {art.get('pubdate', '')}".strip(" ·"),
+                    "source_id": "pubmed",
+                    "lang":      "en",
+                })
+            log.info("LIVE pubmed: %d articles via 2-step E-utilities", len(pubmed_raw))
+        except Exception as e:
+            log.warning("LIVE pubmed: failed — %s", e)
+
+    # ── All other sites: generic parallel search ─────────────────────────────
     raw_results = await live_search_all(
-        query, targets, ls_configs,
+        query, other_targets, ls_configs,
         timeout=app_settings.live_search_timeout_sec,
     )
+    raw_results.extend(pubmed_raw)
 
     # Adapt to SearchResult format
     adapted = adapt_live_results(raw_results)

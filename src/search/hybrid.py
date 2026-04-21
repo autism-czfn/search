@@ -79,6 +79,7 @@ def merge_and_rerank(
     user_lang: str = "en",
     cross_lingual: bool = False,
     target_lang: str | None = None,
+    official_only: bool = False,
 ) -> tuple[list[dict], SearchMode]:
     """
     Merge semantic and keyword result dicts, normalise scores, apply
@@ -87,6 +88,11 @@ def merge_and_rerank(
     Ranking formula (from ranking.py):
       0.40 * source_authority + 0.30 * trigger_match + 0.15 * context_match
       + 0.10 * language_match + 0.05 * recency
+
+    Args:
+        official_only: When True, drops any merged item whose authority_tier != 1
+            after registry enrichment. Acts as a safety net in case non-official
+            items were not already filtered at the DB query level.
 
     Returns:
         (ranked_results, search_mode)
@@ -175,6 +181,31 @@ def merge_and_rerank(
         )
         active_items = items
 
-    # ── Rerank and truncate ──────────────────────────────────────────────────
+    # ── Filter to official sources only (authority_tier=1) ───────────────────
+    # Acts as a post-merge safety net: ensures only government/health-authority
+    # sources (CDC, NIH, NHS, NICE, etc.) appear in results regardless of what
+    # the DB queries returned.
+    if official_only:
+        official_items = [it for it in active_items if it.get("authority_tier") == 1]
+        removed = len(active_items) - len(official_items)
+        if removed:
+            log.info("official_only filter removed %d non-tier-1 results, kept %d",
+                     removed, len(official_items))
+        # Never fall back to unfiltered — returning reddit/non-official results is
+        # worse than returning nothing. Caller will trigger live search instead.
+        active_items = official_items
+
+    # ── Rerank and deduplicate by URL, then truncate ─────────────────────────
+    # Sort first so that when two items share a URL the higher-scoring one
+    # survives (e.g. a local DB entry beats a live duplicate of the same page).
     active_items.sort(key=lambda x: x["combined_score"], reverse=True)
-    return active_items[:top_n], mode
+    seen_urls: set[str] = set()
+    deduped: list[dict] = []
+    for item in active_items:
+        url = item.get("url") or ""
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+        deduped.append(item)
+    return deduped[:top_n], mode

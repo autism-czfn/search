@@ -118,6 +118,10 @@ class SourceRegistry:
         """Get active sources with access_mode == 'live_search'."""
         return [s for s in self._all if s.access_mode == "live_search" and s.is_active]
 
+    def get_official_surface_keys(self) -> list[str]:
+        """Get surface_keys of all authority_tier=1 (official government/health authority) sources."""
+        return [s.surface_key for s in self._all if s.authority_tier == 1]
+
     def get_authority_boost(self, surface_key: str) -> float:
         """Return additive authority boost for a source. Tier 1→+0.20, 2→+0.15, 3→+0.05."""
         entry = self.get_source_by_key(surface_key)

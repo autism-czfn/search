@@ -39,41 +39,83 @@ is_running() {
 
 start_service() {
     echo ""
+
+    # ── Stop any existing process ──────────────────────────────────────────────
     if is_running; then
         local old_pids
         old_pids=$(pgrep -f "$PROC_PATTERN")
         echo "  ↻  Stopping existing process(es): $old_pids"
-        pkill -f "$PROC_PATTERN" 2>/dev/null
-        # Wait up to 5 s for process to exit
-        for i in {1..10}; do
+
+        # SIGTERM first — give the process a chance to shut down cleanly
+        kill -TERM $old_pids 2>/dev/null
+
+        # Wait up to 8 s for graceful exit
+        local waited=0
+        while pgrep -f "$PROC_PATTERN" >/dev/null 2>&1; do
             sleep 0.5
-            pgrep -f "$PROC_PATTERN" >/dev/null 2>&1 || break
+            waited=$((waited + 1))
+            if [ $waited -ge 16 ]; then
+                # Still alive after 8 s — force kill
+                echo "  ⚠️   Process did not exit gracefully — sending SIGKILL"
+                kill -KILL $(pgrep -f "$PROC_PATTERN") 2>/dev/null
+                sleep 1
+                break
+            fi
         done
+
+        if pgrep -f "$PROC_PATTERN" >/dev/null 2>&1; then
+            echo "  ❌  Could not stop existing process (permission denied?)"
+            echo "      Run as the same user that started the service, or use sudo."
+            echo ""
+            return 1
+        fi
+        echo "  ✅  Existing process stopped"
     fi
 
+    # ── Verify port is free before starting ───────────────────────────────────
+    if ss -tlnp 2>/dev/null | grep -q ":$PORT "; then
+        echo "  ❌  Port $PORT is still in use — cannot start"
+        echo "      Check: ss -tlnp | grep :$PORT"
+        echo ""
+        return 1
+    fi
+
+    # ── Prerequisites check ───────────────────────────────────────────────────
     if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ] || [ ! -f "$ENV_FILE" ]; then
         echo "  ⚠️   Missing prerequisites (cert and/or .env)"
         echo "      Run option 5 first to set them up."
         echo ""
-        return
+        return 1
     fi
 
+    # ── Start ─────────────────────────────────────────────────────────────────
     cd "$SCRIPT_DIR" || return
     nohup "$VENV_UVICORN" "$APP" --host 0.0.0.0 --port "$PORT" \
         --ssl-certfile "$CERT_FILE" \
         --ssl-keyfile  "$KEY_FILE" \
         > "$LOGFILE" 2>&1 &
-    echo $! > "$PIDFILE"
-    sleep 1
+    local new_pid=$!
+    echo $new_pid > "$PIDFILE"
 
-    if is_running; then
+    # Wait up to 5 s for the process to actually come up
+    local started=0
+    for i in {1..10}; do
+        sleep 0.5
+        if pgrep -f "$PROC_PATTERN" >/dev/null 2>&1; then
+            started=1
+            break
+        fi
+    done
+
+    if [ $started -eq 1 ]; then
         local ip
         ip=$(get_local_ip)
-        echo "  ✅  Service started (PID $(cat $PIDFILE))"
+        echo "  ✅  Service started (PID $new_pid)"
         echo "  🌐  API: https://$ip:$PORT/api"
         echo "  📄  Logs: $LOGFILE"
     else
         echo "  ❌  Failed to start — check $LOGFILE for details"
+        tail -5 "$LOGFILE" 2>/dev/null | sed 's/^/      /'
     fi
     echo ""
 }

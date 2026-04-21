@@ -43,6 +43,7 @@ from ..search.trigger_policy import should_search, fetch_and_invalidate_trigger_
 from ..search.ranking import compute_search_score
 from ..search.multilingual import run_multilingual_search
 from ..search.live_fallback import determine_route, run_live_search
+from ..search.query_transform import transform_query
 from ..evidence.search import fetch_curated_evidence, generate_recommendations
 from ..safety_state import set_safety_flag, get_safety_flag
 from .models import (
@@ -54,6 +55,7 @@ from .models import (
     PatternWithEvidence,
     TriggerEventPayload, TriggerEventResponse,
     SafetyWebhookPayload, SafetyWebhookResponse,
+    ChatSearchRequest, ChatSearchResult, ChatSearchResponse,
 )
 from .stream import search_stream_generator
 
@@ -199,12 +201,13 @@ async def search(
     # ── Step 2: semantic search ─────────────────────────────────────────────
     sem_results: list[dict] = []
     if embedding is not None:
-        sem_results = await semantic_search(pool, embedding, fetch_limit, source, days)
+        sem_results = await semantic_search(pool, embedding, fetch_limit, source, days,
+                                            official_only=True)
     t2 = time.monotonic()
     log.info("search SEMANTIC rows=%d elapsed=%dms", len(sem_results), int((t2 - t1) * 1000))
 
     # ── Step 3: keyword search ──────────────────────────────────────────────
-    kw_results = await keyword_search(pool, q, fetch_limit, source, days)
+    kw_results = await keyword_search(pool, q, fetch_limit, source, days, official_only=True)
     t3 = time.monotonic()
     log.info("search KEYWORD rows=%d elapsed=%dms", len(kw_results), int((t3 - t2) * 1000))
 
@@ -240,6 +243,7 @@ async def search(
         sem_results, all_kw, top_n=effective_limit * 2,
         query_text=q, user_lang=lang,
         cross_lingual=cross_lingual, target_lang=target_lang,
+        official_only=True,
     )
     t4 = time.monotonic()
     log.info("search MERGE mode=%s results=%d elapsed=%dms", mode, len(merged), int((t4 - t3) * 1000))
@@ -261,6 +265,7 @@ async def search(
             sem_results, all_kw, top_n=effective_limit * 2,
             query_text=q, user_lang=lang,
             cross_lingual=cross_lingual, target_lang=target_lang,
+            official_only=True,
         )
 
     # ── P6: audience filtering ──────────────────────────────────────────────
@@ -414,6 +419,135 @@ async def search_stream(
             "X-Accel-Buffering": "no",   # disable nginx / proxy response buffering
         },
     )
+
+
+# ── /api/chat-search ─────────────────────────────────────────────────────────
+
+@router.post("/chat-search", response_model=ChatSearchResponse)
+async def chat_search(
+    body: ChatSearchRequest,
+    pool=Depends(get_pool),
+):
+    """
+    POST /api/chat-search — simplified search endpoint for collect's chat pipeline.
+
+    Runs the same hybrid search pipeline as /api/search but:
+      - Accepts a JSON body (not query params)
+      - Skips LLM summary, cache, and personalization
+      - Returns a simplified result schema: {title, url, snippet, source, score}
+      - Audience filtering active in Phase 1 (same logic as /api/search)
+      - On any unhandled exception, returns results: [] (graceful degradation)
+    """
+    effective_limit = min(body.limit, settings.max_result_limit)
+    fetch_limit = effective_limit * 2
+
+    t0 = time.monotonic()
+    log.info("chat_search START q=%r limit=%s audience=%s", body.query, effective_limit, body.audience)
+
+    sites_attempted = 0
+    try:
+        # Step 0: transform the raw user question into focused search keywords.
+        # "how to deal with food pattern?" → "autism food selectivity eating mealtime behavior"
+        # Falls back to body.query on any failure (CLI absent, timeout, etc.)
+        search_query = await transform_query(body.query)
+        if search_query != body.query:
+            log.info("chat_search TRANSFORM %r → %r", body.query, search_query)
+
+        # Step 1: intent classification
+        intent = classify_intent(search_query)
+
+        # Step 2: embed query
+        embedding = await embed_query(search_query)
+
+        # Step 3: semantic search
+        sem_results: list[dict] = []
+        if embedding is not None:
+            sem_results = await semantic_search(pool, embedding, fetch_limit, None, None,
+                                                official_only=True)
+
+        # Step 4: keyword search
+        kw_results = await keyword_search(pool, search_query, fetch_limit, None, None,
+                                          official_only=True)
+
+        # Step 5: merge and rerank
+        merged, mode = merge_and_rerank(
+            sem_results, kw_results,
+            top_n=fetch_limit,
+            query_text=search_query,
+            official_only=True,
+        )
+
+        # Steps 6-7: route decision + live search
+        # Always run live search so sites_attempted is always reported in the response.
+        # For LOCAL_ONLY the live results are discarded (local DB was sufficient),
+        # but we still want to show the user how many sources were checked.
+        route = determine_route(merged, search_query, intent=intent)
+        log.info("chat_search ROUTE=%s local=%d", route, len(merged))
+
+        fallback_results, sites_attempted = await run_live_search(search_query, merged)
+        if route in ("HYBRID", "LIVE_ONLY", "SAFETY_EXPANDED_MODE") and fallback_results:
+            # Live results have already been content-verified in site_search.py,
+            # so relax official_only here to allow content-verified tier-2 sources
+            # (EuropePMC, Semantic Scholar, ClinicalTrials, etc.) to surface when
+            # they are the best available answer for the query.
+            merged, mode = merge_and_rerank(
+                sem_results, kw_results + fallback_results,
+                top_n=fetch_limit,
+                query_text=search_query,
+                official_only=False,
+            )
+
+        # Step 8: audience filtering (production-tested logic from /api/search)
+        if body.audience:
+            audience_key = "parent_facing" if body.audience == "parent" else "clinician_facing"
+            filtered = [
+                item for item in merged
+                if item.get("audience_type") in (audience_key, "mixed", None)
+            ]
+            if filtered:
+                merged = filtered
+            else:
+                log.warning(
+                    "chat_search: audience filter '%s' removed all results — returning unfiltered",
+                    body.audience,
+                )
+
+        # Step 9: drop zero-score LOCAL DB results only — live results (id < 0)
+        # are content-verified at fetch time and always kept so the scoring system
+        # can rank them. Zero-score local results are provably off-topic (trigger
+        # terms absent from title/description/body).
+        scored = [r for r in merged if r.get("combined_score", 0) > 0 or (r.get("id") or 0) < 0]
+        if scored:
+            merged = scored
+        else:
+            log.warning("chat_search: all results scored 0 — returning unfiltered for q=%r (transformed=%r)", body.query, search_query)
+
+        # Step 10: truncate to requested limit
+        merged = merged[:effective_limit]
+
+    except Exception as exc:
+        log.warning("chat_search FAILED q=%r — returning empty results: %s", body.query, exc)
+        return ChatSearchResponse(results=[])
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    log.info("chat_search DONE q=%r mode=%s results=%d elapsed=%dms",
+             body.query, mode, len(merged), elapsed_ms)
+
+    # Step 10: build simplified response
+    results: list[ChatSearchResult] = []
+    for item in merged:
+        snippet = item.get("description") or ""
+        if not snippet and item.get("content_body"):
+            snippet = item["content_body"][:300]
+        results.append(ChatSearchResult(
+            title=item.get("title", ""),
+            url=item.get("url", ""),
+            snippet=snippet or None,
+            source=item.get("source_name"),
+            score=float(item.get("combined_score", 0.0)),
+        ))
+
+    return ChatSearchResponse(results=results, sites_attempted=sites_attempted, search_query=search_query)
 
 
 # ── /api/stats ───────────────────────────────────────────────────────────────
@@ -848,11 +982,12 @@ async def receive_safety_webhook(
     embedding = await embed_query(query)
     sem_results: list[dict] = []
     if embedding is not None:
-        sem_results = await semantic_search(pool, embedding, 20)
+        sem_results = await semantic_search(pool, embedding, 20, official_only=True)
 
-    kw_results = await keyword_search(pool, query, 20)
+    kw_results = await keyword_search(pool, query, 20, official_only=True)
 
-    merged, mode = merge_and_rerank(sem_results, kw_results, top_n=20, query_text=query)
+    merged, mode = merge_and_rerank(sem_results, kw_results, top_n=20, query_text=query,
+                                    official_only=True)
 
     # Force live search for safety events
     route = determine_route(merged, query, intent=intent)
@@ -861,7 +996,8 @@ async def receive_safety_webhook(
         fallback_results, _ = await run_live_search(query, merged)
         if fallback_results:
             all_kw = kw_results + fallback_results
-            merged, mode = merge_and_rerank(sem_results, all_kw, top_n=20, query_text=query)
+            merged, mode = merge_and_rerank(sem_results, all_kw, top_n=20, query_text=query,
+                                            official_only=True)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     results_count = len(merged)
@@ -929,11 +1065,12 @@ async def receive_trigger_event(
     embedding = await embed_query(query)
     sem_results: list[dict] = []
     if embedding is not None:
-        sem_results = await semantic_search(pool, embedding, 20)
+        sem_results = await semantic_search(pool, embedding, 20, official_only=True)
 
-    kw_results = await keyword_search(pool, query, 20)
+    kw_results = await keyword_search(pool, query, 20, official_only=True)
 
-    merged, mode = merge_and_rerank(sem_results, kw_results, top_n=20, query_text=query)
+    merged, mode = merge_and_rerank(sem_results, kw_results, top_n=20, query_text=query,
+                                    official_only=True)
 
     # Force live search for safety events
     route = determine_route(merged, query, intent=intent)
@@ -942,7 +1079,8 @@ async def receive_trigger_event(
         fallback_results, _ = await run_live_search(query, merged)
         if fallback_results:
             all_kw = kw_results + fallback_results
-            merged, mode = merge_and_rerank(sem_results, all_kw, top_n=20, query_text=query)
+            merged, mode = merge_and_rerank(sem_results, all_kw, top_n=20, query_text=query,
+                                            official_only=True)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     results_count = len(merged)

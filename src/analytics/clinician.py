@@ -199,10 +199,11 @@ async def _search_evidence(evidence_pool, query: str, limit: int = 3) -> list[di
         from ..search.hybrid import merge_and_rerank
 
         embedding = await embed_query(query)
-        sem = await semantic_search(evidence_pool, embedding, limit * 2, None, None) \
-              if embedding else []
-        kw  = await keyword_search(evidence_pool, query, limit * 2, None, None)
-        merged, _ = merge_and_rerank(sem, kw, top_n=limit)
+        sem = await semantic_search(evidence_pool, embedding, limit * 2, None, None,
+                                    official_only=True) if embedding else []
+        kw  = await keyword_search(evidence_pool, query, limit * 2, None, None,
+                                   official_only=True)
+        merged, _ = merge_and_rerank(sem, kw, top_n=limit, official_only=True)
         return merged
     except Exception as e:
         log.warning("clinician evidence search failed: %s", e)

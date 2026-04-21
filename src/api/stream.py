@@ -177,7 +177,8 @@ async def search_stream_generator(
         })
         sem_results: list[dict] = []
         if embedding is not None:
-            sem_results = await semantic_search(pool, embedding, fetch_limit, source, days)
+            sem_results = await semantic_search(pool, embedding, fetch_limit, source, days,
+                                                official_only=True)
 
         # ── stage: keyword ────────────────────────────────────────────────────
         yield _sse("stage", {
@@ -185,7 +186,8 @@ async def search_stream_generator(
             "message":    "Running keyword search…",
             "elapsed_ms": elapsed(),
         })
-        kw_results = await keyword_search(pool, q, fetch_limit, source, days)
+        kw_results = await keyword_search(pool, q, fetch_limit, source, days,
+                                          official_only=True)
 
         # ── early exit: no results ────────────────────────────────────────────
         if not sem_results and not kw_results:
@@ -208,7 +210,8 @@ async def search_stream_generator(
             "message":    "Merging and ranking results…",
             "elapsed_ms": elapsed(),
         })
-        merged, mode = merge_and_rerank(sem_results, kw_results, top_n=limit)
+        merged, mode = merge_and_rerank(sem_results, kw_results, top_n=limit,
+                                        official_only=True)
         search_time = elapsed()
         log.info("stream MERGE mode=%s results=%d elapsed=%dms", mode, len(merged), search_time)
 

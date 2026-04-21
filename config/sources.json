@@ -1,10 +1,10 @@
 {
-  "_comment": "Source registry for Trusted Search MVP. 26 sources with live search configs.",
-  "_updated": "2026-04-16",
+  "_comment": "Source registry for Trusted Search MVP. 30 sources total; 23 have live_search configured and can be searched at runtime. 7 have live_search=null and are crawl/index-only.",
+  "_updated": "2026-04-20",
   "sources": [
     {
       "source_id": "pubmed",
-      "surface_key": "pubmed",
+      "surface_key": "pubmed_autism",
       "domain": "pubmed.ncbi.nlm.nih.gov",
       "organization_name": "PubMed",
       "language": "en",
@@ -143,7 +143,7 @@
       "search_url": null,
       "is_active": true,
       "update_frequency": "weekly",
-      "notes": null,
+      "notes": "Not live-searchable: shares domain (www.cdc.gov) with cdc_autism which already has live_search configured. Covered via crawl/index only.",
       "live_search": null
     },
     {
@@ -163,7 +163,7 @@
       "search_url": null,
       "is_active": true,
       "update_frequency": "weekly",
-      "notes": null,
+      "notes": "Not live-searchable: shares domain (www.cdc.gov) with cdc_autism which already has live_search configured. Study-specific sub-site; covered via crawl/index only.",
       "live_search": null
     },
     {
@@ -239,7 +239,7 @@
       "search_url": null,
       "is_active": false,
       "update_frequency": "weekly",
-      "notes": "Not yet connected. SODA API for prevalence/statistics only.",
+      "notes": "Not live-searchable: is_active=false, SODA API not yet connected. Statistics/prevalence data only; no full-text search endpoint available.",
       "live_search": null
     },
     {
@@ -802,7 +802,7 @@
       "search_url": null,
       "is_active": true,
       "update_frequency": "daily",
-      "notes": "France's equivalent of NICE UK. Full clinical practice guidelines for autism diagnosis and interventions.",
+      "notes": "Not live-searchable: French-language site with no accessible search API or HTML search endpoint. France's equivalent of NICE UK. Full clinical practice guidelines for autism diagnosis and interventions. Covered via crawl/index only.",
       "live_search": null
     },
     {
@@ -822,7 +822,7 @@
       "search_url": null,
       "is_active": true,
       "update_frequency": "daily",
-      "notes": "Professional medical info network. 11 dedicated autism pages: definition, causes, diagnostics, therapy, parent guidance.",
+      "notes": "Not live-searchable: German-language site with no accessible search API or HTML search endpoint. Professional medical info network with 11 dedicated autism pages. Covered via crawl/index only.",
       "live_search": null
     },
     {
@@ -842,7 +842,7 @@
       "search_url": null,
       "is_active": true,
       "update_frequency": "daily",
-      "notes": "Official national developmental disability portal. Awareness, definitions, lifestage guidance, early detection.",
+      "notes": "Not live-searchable: Japanese-language site with no accessible search API or HTML search endpoint. Official national developmental disability portal. Covered via crawl/index only.",
       "live_search": null
     },
     {
@@ -862,7 +862,7 @@
       "search_url": null,
       "is_active": true,
       "update_frequency": "daily",
-      "notes": "National autism confederation. What is autism, detection/diagnosis with DSM-5, evidence-based FAQs.",
+      "notes": "Not live-searchable: Spanish-language site with no accessible search API or HTML search endpoint. National autism confederation. Covered via crawl/index only.",
       "live_search": null
     }
   ]

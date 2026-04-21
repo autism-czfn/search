@@ -134,6 +134,7 @@ async def search_local_translated(
     kw_results = await keyword_search(
         pool, query_translated, fetch_limit,
         source=None, days=None, fts_config=fts_config,
+        official_only=True,
     )
     log.info("Multilingual keyword search (%s, fts=%s): %d results",
              lang, fts_config, len(kw_results))
@@ -144,6 +145,7 @@ async def search_local_translated(
     if embedding is not None:
         sem_results = await semantic_search(
             pool, embedding, fetch_limit, source=None, days=None,
+            official_only=True,
         )
         log.info("Multilingual semantic search (%s): %d results", lang, len(sem_results))
 
