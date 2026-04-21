@@ -6,11 +6,13 @@
 
 ## 功能概述
 
+- **查询变换（Step 0）**：调用 `claude -p` 将用户口语化问题转换为面向学术/专业站点的精炼搜索关键词（例：「怎么处理孩子的食物问题」→ `autism food selectivity restricted eating mealtime sensory ABA intervention`）；转换后的查询字符串随 `evidence_live` SSE 事件返回，并在 UI 用户气泡下方展示为蓝色搜索芯片，失败时静默回退到原始查询
 - **混合搜索**：`fastembed` 向量相似度 + PostgreSQL 全文检索，归一化评分后加权合并
 - **意图分类**：基于同义词/规则的意图识别（BEHAVIORAL / MEDICAL / SAFETY / GENERAL），替代脆弱的关键词匹配，安全场景自动升级
 - **5 因子排序**：source_authority (0.40) + trigger_match (0.30) + context_match (0.15) + language_match (0.10) + recency (0.05)，权重可通过 `config/ranking.json` 调整
 - **源注册表**：`config/sources.json` 定义 28 个可信来源（Tier 1/2/3），替代硬编码 boost 列表，驱动权限过滤与排序
-- **实时站内搜索**：对 28 个官方站点直接搜索（JSON API / HTML 抓取 / Sitemap），不依赖 Google/Bing
+- **实时站内搜索**：对 23 个官方站点直接搜索（JSON API / HTML 抓取 / Sitemap），不依赖 Google/Bing；含页面内容校验——抓取后确认正文包含查询相关词汇，过滤仅含 Cookie Banner 等无关内容的页面
+- **实时结果直通**：实时搜索结果（id < 0）跳过分数门控，直接进入排序阶段，确保有效实时结果不被错误过滤
 - **搜索路由引擎**：根据意图分类和本地结果质量，智能选择 LOCAL_ONLY / HYBRID / LIVE_ONLY / SAFETY_EXPANDED_MODE 模式；安全场景强制触发实时搜索
 - **SAFETY_EXPANDED_MODE (P-SRC-6)**：高危意图（self_harm / suicide / violence / abuse）或 Redis 安全标志激活时触发；两阶段并行扇出覆盖全部 Tier-1 / Tier-2 来源，绕过缓存，强制多样性约束；自伤意图额外返回 cross_source_consensus、key_clinical_guidance、urgent_help_section（后者硬编码兜底，永不缺失）
 - **Redis 安全状态 (P-SRC-6b)**：`src/safety_state.py` 以 `safety:{child_id}` 为 Key、TTL 1800s（30 分钟）在 Redis 存储安全标志；Redis 不可用时优雅降级（不崩溃）
@@ -35,6 +37,9 @@
 
 ```
 User Query
+   ↓
+[0] Query Transform (claude -p) — 口语问题 → 精炼搜索关键词
+   │   src/search/query_transform.py；失败时原样通过
    ↓
 [1] Intent Classification (BEHAVIORAL / MEDICAL / SAFETY / GENERAL)
    ↓
@@ -67,14 +72,16 @@ User Query
    │   └─► Local Context Qualification (4-factor gate)
    │
    ├─ LIVE path:
-   │   └─► Site Search Engine (28 sites: API / HTML / Sitemap)
+   │   └─► Site Search Engine (23 searchable sites: API / HTML / Sitemap)
+   │         └─► Content Verification (正文含查询词才保留)
    │
    └─ MULTILINGUAL path:
        └─► translate query → local DB search → translate snippets
    ↓
-[6] merge_and_rerank (5-factor ranking formula)
+[6] Score Filter + merge_and_rerank (5-factor ranking formula)
         source_authority × 0.40 + trigger_match × 0.30
       + context_match × 0.15 + language_match × 0.10 + recency × 0.05
+        实时结果（id < 0）跳过分数门控，直接参与排序
    ↓
 [7] Evidence Cache (store/retrieve by query_hash + lang + date)
    ↓
@@ -206,6 +213,34 @@ safety_extras  × 0-1  (cross_source_consensus, key_clinical_guidance, urgent_he
 done           × 1    (总耗时)
 ```
 
+### `POST /api/chat-search`
+
+供 collect 聊天管道调用的实时搜索端点（Stage 2B）。
+
+**请求体（JSON）**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `query` | string | ✅ | 用户原始查询 |
+| `limit` | int |  | 最大返回条数（默认 5）|
+| `audience` | string |  | `parent` / `clinician` |
+
+**行为**：
+1. **Step 0**：`transform_query(query)` — 调用 `claude -p` 将口语化问题变换为精炼搜索关键词；失败时静默回退到原始查询
+2. 以变换后的 `search_query` 进行意图分类、路由、实时站内搜索
+3. 实时结果（id < 0）跳过分数门控，直接参与 5 因子重排
+4. 返回 `search_query` 字段，供 UI 展示实际搜索词
+
+**响应** `ChatSearchResponse`：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `results` | list | 搜索结果卡片 |
+| `sites_attempted` | int | 本次查询的站点数 |
+| `search_query` | string \| null | 实际用于搜索的变换后查询词 |
+
+`search_query` 经由 collect 的 `chat_retrieval.retrieve_live()` → `chat.py` SSE `evidence_live` 事件 → UI `appendLiveSearchChip()` 展示为用户气泡下方的蓝色搜索芯片。
+
 ### `POST /api/safety-webhook`
 
 接收 collect 服务的安全事件推送（P-SRC-6b）。
@@ -309,11 +344,15 @@ search/
 │   ├── safety.py                  # 两层安全检测（意图分类器 + LLM）
 │   ├── safety_state.py            # Redis 安全标志 set/get（P-SRC-6b，TTL 1800s）
 │   ├── api/
-│   │   ├── routes.py              # 所有 API 端点（含 /api/safety-webhook）
+│   │   ├── routes.py              # 所有 API 端点（含 /api/safety-webhook, /api/chat-search）
+│   │   │                          #   Step 0：transform_query → 精炼搜索关键词
+│   │   │                          #   实时结果（id<0）跳过分数门控直通排序
 │   │   ├── stream.py              # SSE 生成器（含 SAFETY_EXPANDED_MODE 事件序列）
 │   │   └── models.py              # Pydantic 模型（含 SafetyWebhookPayload/Response,
-│   │                              #   SafetyExtras, SafetySearchResponse）
+│   │                              #   SafetyExtras, SafetySearchResponse,
+│   │                              #   ChatSearchResponse.search_query）
 │   ├── search/
+│   │   ├── query_transform.py     # Step 0：claude -p 查询变换（口语 → 精炼关键词）
 │   │   ├── semantic.py            # pgvector 余弦相似度
 │   │   ├── keyword.py             # tsvector 全文检索（支持多语言 FTS config）
 │   │   ├── hybrid.py              # 归一化 + 合并重排（registry-driven boost）
@@ -325,7 +364,7 @@ search/
 │   │   ├── live_fallback.py       # 搜索路由引擎（LOCAL/HYBRID/LIVE/SAFETY_EXPANDED）
 │   │   ├── safety_expanded.py     # SAFETY_EXPANDED_MODE 实现（P-SRC-6）
 │   │   │                          #   两阶段 Tier-1/2 扇出、多样性约束、危机语言检测
-│   │   ├── site_search.py         # 28 站实时站内搜索引擎
+│   │   ├── site_search.py         # 23 站实时站内搜索引擎（含页面内容校验）
 │   │   ├── multilingual.py        # 多语言搜索（翻译 → 检索 → 回译）
 │   │   └── pubmed.py              # PubMed E-utilities 客户端
 │   ├── sources/
@@ -365,7 +404,9 @@ search/
 | 非英文 | France HAS (fr), Germany Neuro (de), Japan DDIS (ja), Spain Autismo (es) | 4 |
 | 其他 | OpenAlex（补充）等 | 1 |
 
-爬取与入库由姊妹项目 `collect` 负责；本服务只读 `crawled_items` 与 `embedding`。实时搜索通过站内 API/HTML 直接查询各站点。
+爬取与入库由姊妹项目 `collect` 负责；本服务只读 `crawled_items` 与 `embedding`。实时搜索通过站内 API/HTML 直接查询各站点（`sources.json` 中 23 个可搜索来源，Reddit、HackerNews 等 5 个爬取来源不参与实时搜索）。
+
+实时搜索含页面内容校验：抓取页面后验证正文包含查询相关词汇，过滤仅有 Cookie Banner 等无关内容的结果（如 PLOS ONE fMRI 文章出现在食物查询中的情况）。
 
 SAFETY_EXPANDED_MODE 下，Tier-1 来源（CDC, NIMH, NICE, NHS, AAP, Mayo Clinic, PubMed）优先覆盖，若 Phase 1 结果不满足多样性约束，则追加 Tier-2 来源（Europe PMC, Semantic Scholar, OpenAlex, ClinicalTrials.gov）。
 
@@ -375,10 +416,11 @@ SAFETY_EXPANDED_MODE 下，Tier-1 来源（CDC, NIMH, NICE, NHS, AAP, Mayo Clini
 
 1. **意图优先于关键词** — 语义意图分类替代脆弱的精确关键词匹配
 2. **安全优先于一切** — 高危意图或 Redis 安全标志强制激活 SAFETY_EXPANDED_MODE，绕过缓存，永不仅依赖本地数据
-3. **实时确保正确性** — 直接搜索官方来源，不依赖第三方搜索引擎
+3. **实时确保正确性** — 直接搜索官方来源，不依赖第三方搜索引擎；页面内容校验过滤无关结果
 4. **本地实现个性化** — 用户日志上下文注入 LLM 提示
 5. **优雅降级，不静默失败** — 实时失败回退本地 + 警告；本地失败仍返回实时；均失败返回安全兜底消息；Redis 不可用不影响核心功能
 6. **危机响应永不缺失** — `urgent_help_section` 硬编码兜底，LLM 失败时自动使用（911 / 988 / 741741）
+7. **透明搜索过程** — 变换后的实际搜索查询通过 SSE `search_query` 字段返回给 UI，以搜索芯片形式展示在用户气泡下方，让用户清楚看到系统做了哪些努力
 
 ---
 
